@@ -1,124 +1,40 @@
 # ComfyUI-RefineNode
 
-Generic ComfyUI nodes for local image repainting, detail repair, product/logo/text refinement, and paste-back compositing.
+ComfyUI-RefineNode 是一组用于局部重绘、细节修复、产品/logo/文字细化和结果贴回的通用 ComfyUI 节点。
 
-These nodes are model-agnostic. They do not load checkpoints, patch model internals, or require a Diffusers pipeline. Use them before and after any image editing, inpainting, Kontext, Qwen Image Edit Plus, Flux, SD inpaint, or custom repair workflow where you need:
+插件参考了 [RefineAnything](https://github.com/limuloo/RefineAnything) 项目的图像局部细化流程，并将其中适合 ComfyUI 工作流复用的图像、遮罩、参考图预处理和 paste-back 部分整理为独立节点。
 
-- crop the masked region while preserving paste-back metadata;
-- prepare target/reference/mask images at matching sizes;
-- send the processed image into any model-specific generation path;
-- paste the generated result back into the original image through the mask or bbox.
+相关项目：
 
-## Install
+- GitHub: [limuloo/RefineAnything](https://github.com/limuloo/RefineAnything)
+- Hugging Face: [limuloo1999/RefineAnything](https://huggingface.co/limuloo1999/RefineAnything)
 
-Copy this folder into:
+## Installation
 
-```text
-ComfyUI/custom_nodes/ComfyUI-RefineNode
+进入 ComfyUI 的 `custom_nodes` 目录后克隆本仓库：
+
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/1Kynx/ComfyUI-RefineNode.git
 ```
 
-Restart ComfyUI.
-
-`requirements.txt` intentionally has no extra runtime dependency. The nodes use ComfyUI, PyTorch, PIL, and NumPy from the existing ComfyUI environment.
+然后重启 ComfyUI。
 
 ## Nodes
 
 | Node | Output | Purpose |
 |------|--------|---------|
-| `RefineNode Preprocess Mask` | `image`, `spatial_mask_image`, `mask`, `info` | Reads an image plus optional mask, optionally focus-crops the mask region, and stores paste-back metadata in `REFINENODE_INFO`. |
-| `RefineNode Reference Image Process` | `image1`, `image2`, `image3`, `info` | Resizes one to three images to the same target size with shared resize/crop/fill settings, and updates `REFINENODE_INFO` so paste-back can reverse that transform. |
-| `RefineNode Paste Back` | `image`, `paste_mask` | Composites a generated image back into the original image using the original mask or bbox. |
-
-## Generic Wiring
-
-```text
-source image + optional mask
-  -> RefineNode Preprocess Mask
-
-RefineNode Preprocess Mask.image
-  -> your model, VAEEncode, image encoder, inpaint image input, or reference pipeline
-
-RefineNode Preprocess Mask.mask
-  -> your model's mask input, if it has one
-
-RefineNode Preprocess Mask.spatial_mask_image
-  -> optional visual/spatial condition image
-
-model generated image + RefineNode Preprocess Mask.info
-  -> RefineNode Paste Back
-```
-
-Use `RefineNode Reference Image Process` when multiple images must share the same pixels before generation:
-
-```text
-processed target image
-  -> RefineNode Reference Image Process.image1
-
-optional reference image
-  -> RefineNode Reference Image Process.image2
-
-optional spatial mask/control image
-  -> RefineNode Reference Image Process.image3
-
-matching Preprocess Mask.info
-  -> RefineNode Reference Image Process.info
-
-generated image + RefineNode Reference Image Process.info
-  -> RefineNode Paste Back
-```
-
-The `info` input can come from whichever image you intend to paste back into. The node automatically matches `info.items[*].model_image` against image1/image2/image3 by content signature first, then by size, and records the matched slot's resize/crop/fill transform for paste-back.
-
-## Focus Crop
-
-`RefineNode Preprocess Mask` can crop around the painted mask before generation:
-
-- `focus_crop=true` crops the image and mask around the mask bbox;
-- `focus_crop=false` keeps the full image;
-- empty or disconnected masks disable focus crop automatically;
-- `focus_crop_margin` expands the bbox in a normalized 1024-area model scale, so the visible model-space context stays similar across different source resolutions.
-
-Use smaller margins for text/logo/detail repair, and larger margins when the model needs more surrounding context. Use `focus_crop_margin=0` when you want a tight mask bbox crop for a reference image.
-
-## Reference Image Process
-
-`RefineNode Reference Image Process` is a standalone image size alignment node:
-
-- `fit_kontext_size=true` makes image1 choose the nearest Flux/Kontext-style preferred size;
-- `fit_kontext_size=false` uses a `1024 * 1024` target area and rounds width/height to multiples of `8`;
-- image1, optional image2, and optional image3 are all resized to the same target size;
-- `resize_method` is shared by all connected images;
-- `crop_mode=crop` uses center crop behavior;
-- `crop_mode=disable` resizes directly without center cropping;
-- `crop_mode=fill` preserves aspect ratio, scales to fit inside the target, then pads with black.
-
-When `info` is connected, the output `info` stores the transform needed by `RefineNode Paste Back` to reverse this image-size processing before compositing.
+| `RefineNode Preprocess Mask` | `image`, `spatial_mask_image`, `mask`, `info` | 处理输入图像和可选遮罩，输出模型使用的图像、空间遮罩图、遮罩和贴回所需的 `REFINENODE_INFO`。 |
+| `RefineNode Reference Image Process` | `image1`, `image2`, `image3`, `info` | 将一到三张图像处理到一致尺寸，并同步更新 `REFINENODE_INFO`，便于后续准确贴回。 |
+| `RefineNode Paste Back` | `image`, `paste_mask` | 将生成结果按遮罩或裁剪区域贴回原图。 |
 
 ## Example Workflows
 
 `example_workflows/Reference-based Logo Refinement.json`
 
-- uses a target image mask and a separate clean reference image;
-- uses one `RefineNode Preprocess Mask` for the reference crop and another for the target mask;
-- uses `RefineNode Reference Image Process` to align target, reference, and spatial mask;
-- uses ComfyUI's native `TextEncodeQwenImageEditPlus` for Qwen conditioning.
+- 参考图模式案例，用于根据参考图修复目标图中的 logo、文字或产品细节。
+- 使用参考图模式时，确保细化图连接 `image1`，参考图连接 `image2`，细化图遮罩连 `image3`。
 
 `example_workflows/Reference-free Text Refinement.json`
 
-- uses only a target image and painted text mask;
-- sends target image plus spatial mask to the native Qwen text encoder;
-- uses `RefineNode Paste Back` to composite the generated text repair into the original image.
-
-The examples use Qwen Image Edit Plus because it is convenient for reference-guided detail repair, but the RefineNode preprocessing and paste-back nodes are not Qwen-specific.
-
-## Model Encoding
-
-RefineNode no longer includes a Qwen text encoder or model compatibility node. For Qwen Image Edit Plus workflows, use ComfyUI's built-in `TextEncodeQwenImageEditPlus`, shown in the UI as `文本编码（QwenImageEditPlus）`.
-
-Model-specific nodes remain responsible for prompt encoding, image conditioning, reference latents, sampling, and model patches. RefineNode stays focused on model-independent image/mask preprocessing and paste-back.
-
-## Notes
-
-- No color transfer, color alignment, AdaIN, wavelet, or other color correction is applied.
-- No model wrapper, text encoder wrapper, or attention/prompt patch is applied.
-- If color shift or pixel offset appears, compare your model's generated size with `RefineNode Reference Image Process` output and make sure `RefineNode Paste Back` receives the matching processed `info`.
+- 无参考图文字修复案例，用于根据目标图和遮罩直接细化局部文字。
