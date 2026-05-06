@@ -2,7 +2,7 @@
 
 ComfyUI-RefineNode provides a small set of model-agnostic ComfyUI nodes for local repainting, detail repair, product/logo/text refinement, and paste-back compositing.
 
-RefineAnything targets region-specific image refinement: given an input image and a user-specified region (e.g., scribble mask or bounding box), it restores fine-grained details--text, logos, thin structures--while keeping all non-edited pixels unchanged. It supports both reference-based and reference-free refinement.
+[RefineAnything](https://github.com/limuloo/RefineAnything) targets region-specific image refinement: given an input image and a user-specified region (e.g., scribble mask or bounding box), it restores fine-grained details--text, logos, thin structures--while keeping all non-edited pixels unchanged. It supports both reference-based and reference-free refinement.
 
 ## Installation
 
