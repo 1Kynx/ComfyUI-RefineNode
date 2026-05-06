@@ -1,93 +1,100 @@
 # ComfyUI-RefineNode
 
-ComfyUI-RefineNode 是一组用于局部重绘、细节修复、产品/logo/文字细化和结果贴回的通用 ComfyUI 节点。
+ComfyUI-RefineNode provides a small set of model-agnostic ComfyUI nodes for local repainting, detail repair, product/logo/text refinement, and paste-back compositing.
+
+RefineAnything targets region-specific image refinement: given an input image and a user-specified region (e.g., scribble mask or bounding box), it restores fine-grained details--text, logos, thin structures--while keeping all non-edited pixels unchanged. It supports both reference-based and reference-free refinement.
 
 ## Installation
 
-进入 ComfyUI 的 `custom_nodes` 目录后克隆本仓库：
+Clone this repository into your ComfyUI `custom_nodes` directory:
 
 ```bash
 cd ComfyUI/custom_nodes
 git clone https://github.com/1Kynx/ComfyUI-RefineNode.git
 ```
 
-然后重启 ComfyUI。
+Restart ComfyUI after installation.
 
 ## Example Workflows
 
+The included example workflows use the Qwen Image Edit model together with the RefineAnything LoRA.
+
+RefineAnything LoRA:
+[limuloo1999/RefineAnything](https://huggingface.co/limuloo1999/RefineAnything/tree/main)
+
 `example_workflows/Reference-based Logo Refinement.json`
 
-- 参考图模式案例，用于根据参考图修复目标图中的 logo、文字或产品细节。
-- 使用参考图模式时，确保细化图连接 `image1`，参考图连接 `image2`，细化图遮罩连 `image3`。
+- Reference-based workflow for refining logos, text, or product details with a clean reference image.
+- In reference-based mode, connect the target refinement image to `image1`, the reference image to `image2`, and the target refinement mask/spatial mask image to `image3`.
 
 `example_workflows/Reference-free Text Refinement.json`
 
-- 无参考图文字修复案例，用于根据目标图和遮罩直接细化局部文字。
+- Reference-free workflow for refining local text details from the target image and mask only.
 
 ## Node Details
 
 ### RefineNode Preprocess Mask
 
-用于在进入模型前整理细化图和遮罩，并生成后续贴回需要的 `info`。
+Prepares the target image and optional mask before model inference, and creates the `info` data required for accurate paste-back.
 
-输入：
+Inputs:
 
-- `image`: 需要修复或作为参考的图像。
-- `mask`: 可选遮罩；未连接时会使用空遮罩，节点不会报错。
-- `focus_crop`: 开启后会围绕遮罩区域裁剪图像，减少模型需要处理的无关区域。
-- `focus_crop_margin`: 裁剪时保留的额外上下文范围。
-- `spatial_prompt_source`: 控制 `spatial_mask_image` 的来源，`mask` 使用原遮罩形状，`bbox` 使用遮罩外接矩形。
+- `image`: The image to refine or use as a reference.
+- `mask`: Optional mask. If disconnected, the node uses an empty mask and does not raise an error.
+- `focus_crop`: When enabled, crops around the masked region to reduce unrelated image area before generation.
+- `focus_crop_margin`: Extra context retained around the mask crop.
+- `spatial_prompt_source`: Controls the `spatial_mask_image` output. `mask` keeps the original mask shape, while `bbox` uses the mask bounding box.
 
-输出：
+Outputs:
 
-- `image`: 处理后的模型输入图。
-- `spatial_mask_image`: 给 Qwen Image Edit Plus 等图像编辑节点使用的空间遮罩图。
-- `mask`: 与输出 `image` 对齐的遮罩。
-- `info`: 保存原图、裁剪位置、遮罩和贴回坐标的数据，必须传给后续需要贴回的节点。
+- `image`: Processed model input image.
+- `spatial_mask_image`: Spatial mask image for image-editing nodes such as Qwen Image Edit Plus.
+- `mask`: Mask aligned with the output `image`.
+- `info`: Metadata containing the original image, crop position, mask, and paste-back coordinates. Pass this to downstream paste-back nodes.
 
 ### RefineNode Reference Image Process
 
-用于把细化图、参考图和遮罩图处理到完全一致的尺寸，适合多图参考或 Qwen Image Edit Plus 这类需要多张图像输入的工作流。
+Resizes and aligns the target image, reference image, and mask image to exactly the same size. This is useful for multi-image reference workflows and Qwen Image Edit Plus style inputs.
 
-输入：
+Inputs:
 
-- `image1`: 必填，通常连接细化图。
-- `image2`: 可选，通常连接参考图。
-- `image3`: 可选，参考图模式中通常连接细化图遮罩，也就是 `spatial_mask_image`。
-- `info`: 可选，来自 `RefineNode Preprocess Mask`；连接后会同步记录本节点的缩放、裁剪或填充信息，保证 `Paste Back` 能按正确位置贴回。
-- `fit_kontext_size`: 开启时使用 ComfyUI/Flux Kontext 风格的目标尺寸；关闭时按约 `1024 x 1024` 目标面积并按 8 的倍数取整。
-- `resize_method`: 三张图共用的缩放算法，默认 `lanczos`。
-- `crop_mode`: `crop` 居中裁剪到目标比例，`disable` 直接缩放，`fill` 等比缩放后用黑色填充到目标尺寸。
+- `image1`: Required. Usually the target refinement image.
+- `image2`: Optional. Usually the reference image.
+- `image3`: Optional. In reference-based mode, usually the target refinement mask or `spatial_mask_image`.
+- `info`: Optional `REFINENODE_INFO` from `RefineNode Preprocess Mask`. When connected, the node records its resize, crop, or fill transform so `RefineNode Paste Back` can restore the generated image to the correct original position.
+- `fit_kontext_size`: When enabled, uses the ComfyUI/Flux Kontext-style target size. When disabled, uses an approximately `1024 x 1024` target area rounded to multiples of 8.
+- `resize_method`: Shared resize method for all connected images. The default is `lanczos`.
+- `crop_mode`: `crop` center-crops to the target aspect ratio, `disable` resizes directly, and `fill` preserves aspect ratio then pads with black to the target size.
 
-输出：
+Outputs:
 
-- `image1`: 处理后的细化图。
-- `image2`: 处理后的参考图；未连接输入时输出空白占位图。
-- `image3`: 处理后的遮罩图或第三张参考图；未连接输入时输出空白占位图。
-- `info`: 更新后的贴回信息。
+- `image1`: Processed target refinement image.
+- `image2`: Processed reference image. If the input is disconnected, this output is a blank placeholder image.
+- `image3`: Processed mask image or third reference image. If the input is disconnected, this output is a blank placeholder image.
+- `info`: Updated paste-back metadata.
 
-参考图模式注意：
+Reference-based mode reminder:
 
-- 细化图连接 `image1`。
-- 参考图连接 `image2`。
-- 细化图遮罩连接 `image3`。
+- Connect the target refinement image to `image1`.
+- Connect the reference image to `image2`.
+- Connect the target refinement mask/spatial mask image to `image3`.
 
 ### RefineNode Paste Back
 
-用于把模型生成结果贴回原图，输出最终修复图和实际使用的贴回遮罩。
+Composites the generated result back into the original image and returns both the final image and the actual paste mask.
 
-输入：
+Inputs:
 
-- `generated_image`: 模型生成后的图像。
-- `info`: 来自 `RefineNode Preprocess Mask` 或 `RefineNode Reference Image Process` 的贴回信息。
-- `paste_back_mode`: `mask` 按原遮罩贴回，`bbox` 按遮罩外接矩形区域贴回。
-- `mask_grow`: 贴回前扩张遮罩边缘，适合减少细碎边缘漏贴。
-- `blend_blur`: 对贴回遮罩做模糊羽化，适合减轻边缘接缝。
+- `generated_image`: Image generated by the model.
+- `info`: Paste-back metadata from `RefineNode Preprocess Mask` or `RefineNode Reference Image Process`.
+- `paste_back_mode`: `mask` pastes using the original mask, while `bbox` pastes using the mask bounding box.
+- `mask_grow`: Expands the paste mask before compositing. Useful for reducing tiny uncovered edges.
+- `blend_blur`: Blurs and feathers the paste mask to soften seams.
 
-输出：
+Outputs:
 
-- `image`: 贴回后的最终图像。
-- `paste_mask`: 本次实际用于合成的遮罩，方便预览和排查贴回范围。
+- `image`: Final pasted-back image.
+- `paste_mask`: Actual mask used for compositing, useful for previewing and debugging the paste area.
 
 ## Citation
 
