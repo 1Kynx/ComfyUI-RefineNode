@@ -1,0 +1,2 @@
+# This ComfyUI node uses ComfyUI's native torch/PIL/numpy stack.
+# No extra Python package is required for the split-node workflow.
