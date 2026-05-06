@@ -22,7 +22,7 @@ The included example workflows use the Qwen Image Edit model together with the R
 RefineAnything LoRA:
 [limuloo1999/RefineAnything](https://huggingface.co/limuloo1999/RefineAnything/tree/main)
 
-Do not set the `Edit Model Reference Method` node to `index_timestep_zero`; it can introduce a noticeable color shift.
+You can try different options in the `Edit Model Reference Method` node, but it is best to avoid `index_timestep_zero` because it can introduce a noticeable color shift.
 
 `example_workflows/Reference-based Logo Refinement.json`
 
