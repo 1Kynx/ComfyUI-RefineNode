@@ -27,13 +27,9 @@ RefineAnything LoRA:
 - Reference-based workflow for refining logos, text, or product details with a clean reference image.
 - In reference-based mode, connect the target refinement image to `image1`, the reference image to `image2`, and the target refinement mask/spatial mask image to `image3`.
 
-![Reference-based Logo Refinement workflow](example_workflows/Reference-based%20Logo%20Refinement.jpeg)
-
 `example_workflows/Reference-free Text Refinement.json`
 
 - Reference-free workflow for refining local text details from the target image and mask only.
-
-![Reference-free Text Refinement workflow](example_workflows/Reference-free%20Text%20Refinement.jpeg)
 
 ## Node Details
 
