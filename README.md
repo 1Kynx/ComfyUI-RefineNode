@@ -50,6 +50,7 @@ Inputs:
 - `focus_crop`: When enabled, crops around the masked region to reduce unrelated image area before generation.
 - `focus_crop_margin`: Extra context retained around the mask crop.
 - `spatial_prompt_source`: Controls the `spatial_mask_image` output. `mask` keeps the original mask shape, while `bbox` uses the mask bounding box.
+- `combined_mask`: When disabled, a multi-mask `MASK` input is expanded into separate image-list refinement jobs. When enabled, all masks for each source image are combined into one union mask before preprocessing.
 
 Outputs:
 
@@ -57,6 +58,11 @@ Outputs:
 - `spatial_mask_image`: Spatial mask image for image-editing nodes such as Qwen Image Edit Plus.
 - `mask`: Mask aligned with the output `image`.
 - `info`: Metadata containing the original image, crop position, mask, and paste-back coordinates. Pass this to downstream paste-back nodes.
+
+Multi-mask behavior:
+
+- With `combined_mask` disabled, one input image plus multiple masks becomes an image list: one refinement job per mask.
+- With `combined_mask` enabled, multiple masks are merged first and only one refinement job is created per source image.
 
 ### RefineNode Reference Image Process
 
@@ -78,6 +84,8 @@ Outputs:
 - `image2`: Processed reference image. If the input is disconnected, this output is a blank placeholder image.
 - `image3`: Processed mask image or third reference image. If the input is disconnected, this output is a blank placeholder image.
 - `info`: Updated paste-back metadata.
+
+When `image1` or `image3` comes from a multi-mask `RefineNode Preprocess Mask` image list, ComfyUI processes each list item sequentially. A single connected reference image in `image2` is reused for all list items.
 
 Reference-based mode reminder:
 
@@ -101,6 +109,8 @@ Outputs:
 
 - `image`: Final pasted-back image.
 - `paste_mask`: Actual mask used for compositing, useful for previewing and debugging the paste area.
+
+When `generated_image` and `info` arrive as ComfyUI lists, all generated refinement results that belong to the same original source image are pasted back sequentially into that original image. The node returns one final image and one combined paste mask per source image.
 
 ## Citation
 

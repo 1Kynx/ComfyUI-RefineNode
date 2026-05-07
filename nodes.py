@@ -230,7 +230,10 @@ def tensor_mask_to_pil(masks: torch.Tensor, index: int, size: tuple[int, int]) -
         else:
             tensor = tensor.squeeze(-1)
     elif tensor.ndim == 3:
-        tensor = tensor[min(index, tensor.shape[0] - 1)]
+        if tensor.shape[-1] == 1 and tensor.shape[0] > 4 and tensor.shape[1] > 4:
+            tensor = tensor.squeeze(-1)
+        else:
+            tensor = tensor[min(index, tensor.shape[0] - 1)]
     elif tensor.ndim != 2:
         raise ValueError(f"Expected MASK tensor with 2, 3, or 4 dims, got {tuple(masks.shape)}")
 
@@ -242,6 +245,44 @@ def tensor_mask_to_pil(masks: torch.Tensor, index: int, size: tuple[int, int]) -
     if img.size != size:
         img = img.resize(size, _NEAREST)
     return img
+
+
+def mask_batch_size(masks: torch.Tensor | None) -> int:
+    if masks is None:
+        return 0
+    if masks.ndim == 2:
+        return 1
+    if masks.ndim == 3 and masks.shape[-1] == 1 and masks.shape[0] > 4 and masks.shape[1] > 4:
+        return 1
+    if masks.ndim in (3, 4):
+        return int(masks.shape[0])
+    return 1
+
+
+def mask_indices_for_image(image_index: int, image_count: int, mask_count: int) -> list[int]:
+    if mask_count <= 0:
+        return []
+    if image_count <= 1:
+        return list(range(mask_count))
+    if mask_count == 1:
+        return [0]
+    if mask_count == image_count:
+        return [image_index]
+    if mask_count % image_count == 0:
+        masks_per_image = mask_count // image_count
+        start = image_index * masks_per_image
+        return list(range(start, start + masks_per_image))
+    return [min(image_index, mask_count - 1)]
+
+
+def combine_masks(masks: torch.Tensor, indices: list[int], size: tuple[int, int]) -> Image.Image:
+    if not indices:
+        return Image.new("L", size, 0)
+    combined = np.zeros((size[1], size[0]), dtype=np.uint8)
+    for mask_index in indices:
+        mask_l = tensor_mask_to_pil(masks, mask_index, size)
+        combined = np.maximum(combined, np.asarray(mask_l.convert("L"), dtype=np.uint8))
+    return Image.fromarray(combined, mode="L")
 
 
 def pil_to_tensor_image(image: Image.Image) -> torch.Tensor:
@@ -267,6 +308,14 @@ def image_batch_size(images: torch.Tensor | None) -> int:
     if images.ndim == 4:
         return int(images.shape[0])
     return 1
+
+
+def tensor_image_as_list_item(image: Image.Image) -> torch.Tensor:
+    return pil_to_tensor_image(image).unsqueeze(0)
+
+
+def tensor_mask_as_list_item(mask_l: Image.Image) -> torch.Tensor:
+    return pil_to_tensor_mask(mask_l).unsqueeze(0)
 
 
 def upscale_image(samples: torch.Tensor, width: int, height: int, method: str, crop: str = "disabled") -> torch.Tensor:
@@ -499,6 +548,7 @@ class RefineNodePreprocessMask:
                 "focus_crop": ("BOOLEAN", {"default": True}),
                 "focus_crop_margin": ("INT", {"default": 64, "min": 0, "max": 2048}),
                 "spatial_prompt_source": (["mask", "bbox"], {"default": "mask"}),
+                "combined_mask": ("BOOLEAN", {"default": False}),
             },
             "optional": {
                 "mask": ("MASK",),
@@ -507,6 +557,7 @@ class RefineNodePreprocessMask:
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "MASK", "REFINENODE_INFO")
     RETURN_NAMES = ("image", "spatial_mask_image", "mask", "info")
+    OUTPUT_IS_LIST = (True, True, True, True)
     FUNCTION = "preprocess"
     CATEGORY = "RefineNode"
 
@@ -516,23 +567,26 @@ class RefineNodePreprocessMask:
         focus_crop: bool,
         focus_crop_margin: int,
         spatial_prompt_source: str,
+        combined_mask: bool = False,
         mask: torch.Tensor | None = None,
     ):
-        batch = image_batch_size(image)
+        image_count = image_batch_size(image)
+        mask_count = mask_batch_size(mask)
         model_images = []
         spatial_images = []
         model_masks = []
         infos = []
 
-        for index in range(batch):
-            original = normalize_to_srgb(tensor_image_to_pil(image, index))
-            if mask is None:
-                mask_l = Image.new("L", original.size, 0)
-            else:
-                mask_l = tensor_mask_to_pil(mask, index, original.size)
+        def append_job(
+            original: Image.Image,
+            mask_l: Image.Image,
+            source_image_index: int,
+            mask_index: int | None,
+            mask_indices: list[int],
+            is_combined: bool,
+        ) -> None:
             bbox_raw = bbox_from_mask_or_none(mask_l)
             has_region = bbox_raw is not None
-
             model_image = original
             model_mask = mask_l
             crop_box = None
@@ -548,10 +602,11 @@ class RefineNodePreprocessMask:
                 bbox_model = offset_bbox(bbox_raw, crop_box[0], crop_box[1])
 
             spatial_mask = make_spatial_mask(model_mask, spatial_prompt_source, bbox_model)
+            group_id = f"source_image_{source_image_index}"
 
-            model_images.append(pil_to_tensor_image(model_image))
-            spatial_images.append(pil_to_tensor_image(spatial_mask.convert("RGB")))
-            model_masks.append(pil_to_tensor_mask(model_mask))
+            model_images.append(tensor_image_as_list_item(model_image))
+            spatial_images.append(tensor_image_as_list_item(spatial_mask.convert("RGB")))
+            model_masks.append(tensor_mask_as_list_item(model_mask))
             infos.append(
                 {
                     "origin_image": original,
@@ -564,14 +619,64 @@ class RefineNodePreprocessMask:
                     "crop_box": crop_box,
                     "has_region": has_region,
                     "spatial_prompt_source": spatial_prompt_source,
+                    "source_image_index": int(source_image_index),
+                    "mask_index": None if mask_index is None else int(mask_index),
+                    "mask_indices": [int(value) for value in mask_indices],
+                    "group_id": group_id,
+                    "combined_mask": bool(is_combined),
                 }
             )
 
+        for image_index in range(image_count):
+            original = normalize_to_srgb(tensor_image_to_pil(image, image_index))
+            if mask is None:
+                append_job(
+                    original,
+                    Image.new("L", original.size, 0),
+                    image_index,
+                    None,
+                    [],
+                    bool(combined_mask),
+                )
+                continue
+
+            indices = mask_indices_for_image(image_index, image_count, mask_count)
+            if not indices:
+                append_job(
+                    original,
+                    Image.new("L", original.size, 0),
+                    image_index,
+                    None,
+                    [],
+                    bool(combined_mask),
+                )
+                continue
+            if combined_mask:
+                append_job(
+                    original,
+                    combine_masks(mask, indices, original.size),
+                    image_index,
+                    None,
+                    indices,
+                    True,
+                )
+                continue
+
+            for mask_index in indices:
+                append_job(
+                    original,
+                    tensor_mask_to_pil(mask, mask_index, original.size),
+                    image_index,
+                    mask_index,
+                    [mask_index],
+                    False,
+                )
+
         return (
-            torch.stack(model_images, dim=0),
-            torch.stack(spatial_images, dim=0),
-            torch.stack(model_masks, dim=0),
-            {"items": infos},
+            model_images,
+            spatial_images,
+            model_masks,
+            [{"items": [item]} for item in infos],
         )
 
 
@@ -703,6 +808,8 @@ class RefineNodePasteBack:
 
     RETURN_TYPES = ("IMAGE", "MASK")
     RETURN_NAMES = ("image", "paste_mask")
+    INPUT_IS_LIST = True
+    OUTPUT_IS_LIST = (True, True)
     FUNCTION = "paste_back"
     CATEGORY = "RefineNode"
 
@@ -714,55 +821,120 @@ class RefineNodePasteBack:
         mask_grow: int,
         blend_blur: int,
     ):
-        items = info.get("items") if isinstance(info, dict) else None
+        generated_inputs = generated_image if isinstance(generated_image, list) else [generated_image]
+        info_inputs = info if isinstance(info, list) else [info]
+        mode_value = paste_back_mode[0] if isinstance(paste_back_mode, list) else paste_back_mode
+        mask_grow_value = mask_grow[0] if isinstance(mask_grow, list) else mask_grow
+        blend_blur_value = blend_blur[0] if isinstance(blend_blur, list) else blend_blur
+
+        items = []
+        for info_value in info_inputs:
+            if isinstance(info_value, dict):
+                value_items = info_value.get("items")
+                if value_items:
+                    items.extend(value_items)
         if not items:
             raise ValueError("Missing RefineNode Preprocess Mask info.")
 
+        generated_images = []
+        for generated_input in generated_inputs:
+            for index in range(image_batch_size(generated_input)):
+                generated_images.append(normalize_to_srgb(tensor_image_to_pil(generated_input, index)))
+        if not generated_images:
+            raise ValueError("Missing generated images for RefineNode Paste Back.")
+
+        mode = (mode_value or "mask").strip().lower()
+        groups: dict[str, dict[str, Any]] = {}
+        group_order = []
+        for item_index, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            group_id = item.get("group_id")
+            if group_id is None:
+                group_id = f"source_image_{item.get('source_image_index', item_index)}"
+            group_id = str(group_id)
+            if group_id not in groups:
+                groups[group_id] = {
+                    "origin_image": item["origin_image"],
+                    "entries": [],
+                }
+                group_order.append(group_id)
+            groups[group_id]["entries"].append((item_index, item))
+        if not group_order:
+            raise ValueError("Missing valid RefineNode Preprocess Mask info items.")
+
         outputs = []
         masks = []
-        batch = max(image_batch_size(generated_image), len(items))
-        mode = (paste_back_mode or "mask").strip().lower()
+        for group_id in group_order:
+            group = groups[group_id]
+            result = group["origin_image"].copy()
+            combined_mask = Image.new("L", result.size, 0)
 
-        for index in range(batch):
-            item = items[min(index, len(items) - 1)]
-            generated = normalize_to_srgb(tensor_image_to_pil(generated_image, index))
-            original = item["origin_image"]
-            model_image = item["model_image"]
-            model_mask = item["model_mask"]
-            crop_box = item.get("crop_box")
-            bbox_model = item.get("bbox_model")
-            has_region = bool(item.get("has_region", bbox_model is not None))
-            generated = restore_generated_to_model_space(
-                generated,
-                model_image,
-                item.get("reference_image_transform"),
-            )
+            for item_index, item in group["entries"]:
+                generated = generated_images[min(item_index, len(generated_images) - 1)]
+                result, full_mask = self.apply_item_to_result(
+                    result,
+                    item,
+                    generated,
+                    mode,
+                    int(mask_grow_value),
+                    int(blend_blur_value),
+                )
+                combined_mask = Image.fromarray(
+                    np.maximum(
+                        np.asarray(combined_mask.convert("L"), dtype=np.uint8),
+                        np.asarray(full_mask.convert("L").resize(combined_mask.size, _NEAREST), dtype=np.uint8),
+                    ),
+                    mode="L",
+                )
 
-            if not has_region or bbox_model is None:
-                paste_mask = Image.new("L", model_image.size, 255)
-                result_crop = generated.resize(model_image.size, _BICUBIC)
-            elif mode == "bbox":
-                paste_mask = bbox_mask(model_image.size, bbox_model)
-                paste_mask = prepare_paste_mask(paste_mask, int(mask_grow), int(blend_blur))
-                result_crop = composite_masked(model_image, generated, paste_mask)
-            else:
-                paste_mask = binary_mask(model_mask)
-                paste_mask = prepare_paste_mask(paste_mask, int(mask_grow), int(blend_blur))
-                result_crop = composite_masked(model_image, generated, paste_mask)
+            outputs.append(tensor_image_as_list_item(result))
+            masks.append(tensor_mask_as_list_item(combined_mask))
 
-            if crop_box:
-                result = original.copy()
-                result.paste(result_crop, (crop_box[0], crop_box[1]))
-                full_mask = Image.new("L", original.size, 0)
-                full_mask.paste(paste_mask.resize(result_crop.size, _BILINEAR), (crop_box[0], crop_box[1]))
-            else:
-                result = result_crop
-                full_mask = paste_mask
+        return (outputs, masks)
 
-            outputs.append(pil_to_tensor_image(result))
-            masks.append(pil_to_tensor_mask(full_mask))
+    def apply_item_to_result(
+        self,
+        current_result: Image.Image,
+        item: dict[str, Any],
+        generated: Image.Image,
+        mode: str,
+        mask_grow: int,
+        blend_blur: int,
+    ) -> tuple[Image.Image, Image.Image]:
+        original = item["origin_image"]
+        model_image = item["model_image"]
+        model_mask = item["model_mask"]
+        crop_box = item.get("crop_box")
+        bbox_model = item.get("bbox_model")
+        has_region = bool(item.get("has_region", bbox_model is not None))
+        generated = restore_generated_to_model_space(
+            generated,
+            model_image,
+            item.get("reference_image_transform"),
+        )
 
-        return (torch.stack(outputs, dim=0), torch.stack(masks, dim=0))
+        if not has_region or bbox_model is None:
+            paste_mask = Image.new("L", model_image.size, 255)
+        elif mode == "bbox":
+            paste_mask = bbox_mask(model_image.size, bbox_model)
+            paste_mask = prepare_paste_mask(paste_mask, int(mask_grow), int(blend_blur))
+        else:
+            paste_mask = binary_mask(model_mask)
+            paste_mask = prepare_paste_mask(paste_mask, int(mask_grow), int(blend_blur))
+
+        if crop_box:
+            result = current_result.copy()
+            current_crop = result.crop(crop_box)
+            result_crop = composite_masked(current_crop, generated, paste_mask)
+            result.paste(result_crop, (crop_box[0], crop_box[1]))
+            full_mask = Image.new("L", original.size, 0)
+            full_mask.paste(paste_mask.resize(result_crop.size, _BILINEAR), (crop_box[0], crop_box[1]))
+            return result, full_mask
+
+        result = composite_masked(current_result, generated, paste_mask)
+        full_mask = paste_mask.resize(current_result.size, _BILINEAR)
+        return result, full_mask
 
 
 def focus_crop_region(
