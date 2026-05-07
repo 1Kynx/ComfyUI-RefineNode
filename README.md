@@ -77,6 +77,7 @@ Inputs:
 - `fit_kontext_size`: When enabled, uses the ComfyUI/Flux Kontext-style target size. When disabled, uses an approximately `1024 x 1024` target area rounded to multiples of 8.
 - `resize_method`: Shared resize method for all connected images. The default is `lanczos`.
 - `crop_mode`: `crop` center-crops to the target aspect ratio, `disable` resizes directly, and `fill` preserves aspect ratio then pads with black to the target size.
+- `list_match_mode`: `index` keeps ComfyUI list order. `aspect_ratio` matches `image2` and `image3` list items to each `image1` item by closest original width/height ratio.
 
 Outputs:
 
@@ -85,7 +86,7 @@ Outputs:
 - `image3`: Processed mask image or third reference image. If the input is disconnected, this output is a blank placeholder image.
 - `info`: Updated paste-back metadata.
 
-When `image1` or `image3` comes from a multi-mask `RefineNode Preprocess Mask` image list, ComfyUI processes each list item sequentially. A single connected reference image in `image2` is reused for all list items.
+When `list_match_mode` is `index`, list order is preserved and shorter inputs reuse their last item. When `list_match_mode` is `aspect_ratio`, `image2` and `image3` are matched independently to `image1` by closest source aspect ratio. If list items are already the same size in the same order, or if all candidates for a port have the same size, the node keeps index order to avoid unnecessary rematching.
 
 Reference-based mode reminder:
 
