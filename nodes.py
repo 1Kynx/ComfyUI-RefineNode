@@ -681,22 +681,35 @@ def ordered_mask_feature_indices(features: list[dict[str, Any]], indices: list[i
         return []
 
     heights = [features[index]["height"] for index in indices if features[index]["bbox"] is not None]
-    row_gap = max(0.008, min(0.035, (float(np.median(heights)) if heights else 0.03) * 0.65))
+    median_height = float(np.median(heights)) if heights else 0.03
+    row_gap = max(0.01, min(0.08, median_height * 1.25))
     rows: list[dict[str, Any]] = []
 
     for index in sorted(indices, key=lambda value: (features[value]["center_y"], features[value]["center_x"], value)):
         feature = features[index]
+        y1 = feature["y1"]
+        y2 = feature["y2"]
+        feature_height = max(1e-6, feature["height"])
+        is_tall_component = feature_height > median_height * 2.5
         best_row = None
         best_distance = float("inf")
         for row_index, row in enumerate(rows):
             distance = abs(feature["center_y"] - row["center_y"])
-            if distance <= row_gap and distance < best_distance:
+            row_height = max(1e-6, row["y2"] - row["y1"])
+            overlap = max(0.0, min(y2, row["y2"]) - max(y1, row["y1"]))
+            overlap_ratio = overlap / max(1e-6, min(feature_height, row_height))
+            same_row = distance <= row_gap
+            if not is_tall_component:
+                same_row = same_row or overlap_ratio >= 0.45
+            if same_row and distance < best_distance:
                 best_row = row_index
                 best_distance = distance
         if best_row is None:
             rows.append(
                 {
                     "indices": [index],
+                    "y1": y1,
+                    "y2": y2,
                     "center_y": feature["center_y"],
                 }
             )
@@ -704,10 +717,12 @@ def ordered_mask_feature_indices(features: list[dict[str, Any]], indices: list[i
 
         row = rows[best_row]
         row["indices"].append(index)
+        row["y1"] = min(row["y1"], y1)
+        row["y2"] = max(row["y2"], y2)
         row["center_y"] = sum(features[value]["center_y"] for value in row["indices"]) / len(row["indices"])
 
     ordered = []
-    for row in sorted(rows, key=lambda item: item["center_y"]):
+    for row in sorted(rows, key=lambda item: (item["center_y"], item["y1"])):
         ordered.extend(sorted(row["indices"], key=lambda value: (features[value]["center_x"], features[value]["center_y"], value)))
     return ordered
 
