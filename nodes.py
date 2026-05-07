@@ -1158,7 +1158,7 @@ class RefineNodeSliceAndMatchMasks:
         return {
             "required": {
                 "precision": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "min_area_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.001}),
+                "min_area_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
             },
             "optional": {
                 "mask1": ("MASK",),
@@ -1189,12 +1189,20 @@ class RefineNodeSliceAndMatchMasks:
         mask1_images = flatten_mask_input(mask1)
 
         if mask2 is None:
-            grouped_masks = group_mask_images_by_precision(mask1_images, precision, min_area_ratio=min_area_ratio)
+            grouped_masks = group_mask_images_by_precision(
+                mask1_images,
+                precision,
+                min_area_ratio=min_area_ratio,
+            )
             empty_masks = [Image.new("L", grouped_masks[0].size, 0) for _ in grouped_masks]
             return (stack_mask_images(grouped_masks), stack_mask_images(empty_masks))
 
         mask2_images = flatten_mask_input(mask2)
-        anchor_masks = group_mask_images_by_precision(mask1_images, precision, min_area_ratio=min_area_ratio)
+        anchor_masks = group_mask_images_by_precision(
+            mask1_images,
+            precision,
+            min_area_ratio=min_area_ratio,
+        )
         candidate_masks = split_mask_images_to_components(mask2_images, min_area_ratio)
 
         matched_mask2 = match_candidates_to_anchors(anchor_masks, candidate_masks)

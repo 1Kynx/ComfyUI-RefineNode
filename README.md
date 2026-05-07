@@ -68,15 +68,15 @@ Inputs:
 
 - `mask1`: Optional first mask group. Output order is anchored to this group when both inputs are connected.
 - `mask2`: Optional second mask group to match against `mask1`.
-- `precision`: Coarse-to-fine slicing control from `0.0` to `1.0`. With one input, it controls that mask group's output. With two inputs, it controls the first mask group's output slots. `0.0` unions all mask components into one output mask. `1.0` keeps every disconnected component separate with no grouping. Middle values progressively merge more nearest-neighbor bbox groups.
-- `min_area_ratio`: Removes tiny disconnected components before grouping and matching. `0.0` disables filtering. Values are relative to the largest disconnected component in the same input group, so `0.02` removes components smaller than 2% of that largest component's foreground area.
+- `precision`: Coarse-to-fine slicing control from `0.0` to `1.0` with `0.01` step precision. With one input, it controls that mask group's output. With two inputs, it controls the first mask group's output slots. `0.0` unions all mask components into one output mask. `1.0` keeps every disconnected component separate with no grouping. Middle values progressively merge more nearest-neighbor bbox groups.
+- `min_area_ratio`: Removes tiny disconnected components before grouping and matching, with `0.01` step precision. `0.0` disables filtering. Values are relative to the largest disconnected component in the same input group, so `0.02` removes components smaller than 2% of that largest component's foreground area.
 
 Outputs:
 
 - `mask1`: First sliced/grouped mask batch.
 - `mask2`: Second mask batch aligned to `mask1`. When only one input is connected, this is an empty placeholder batch.
 
-The node splits disconnected painted islands internally, removes components below `min_area_ratio`, and then applies grouping. For two-input matching, the second group is split and filtered independently, then assigned into the first group's output slots with row-aware order and normalized product position. If a first-group slot has no reliable second-group match, the second output keeps that slot empty instead of shifting the remaining masks. Use `precision=1.0` when the first mask group is already the exact granularity you want.
+The node splits disconnected painted islands internally, removes components below `min_area_ratio`, and then applies `precision` grouping. For two-input matching, the second group is split and filtered independently, then assigned into the first group's output slots with row-aware order and normalized product position. If a first-group slot has no reliable second-group match, the second output keeps that slot empty instead of shifting the remaining masks. Use `precision=1.0` when the first mask group is already the exact granularity you want.
 
 ### RefineNode Preprocess Mask
 
