@@ -26,7 +26,9 @@ You can try different options in the `Edit Model Reference Method` node, but it 
 
 For workflows with several painted regions, insert the mask-only nodes before `RefineNode Preprocess Mask`:
 
-`Load Image mask` -> `RefineNode Mask Batch Process` -> optional `RefineNode Combine Nearby Masks` -> `RefineNode Preprocess Mask`
+`Load Image mask` -> optional `RefineNode Slice And Match Masks` -> `RefineNode Preprocess Mask`
+
+For two mask groups from the same product, use `RefineNode Slice And Match Masks` to align their output count and order before preprocessing.
 
 `example_workflows/Reference-based Logo Refinement.json`
 
@@ -58,20 +60,23 @@ Outputs:
 
 Use this node when a single `Load Image` mask contains multiple separated painted regions and you want either one refinement job per region or one combined refinement job.
 
-### RefineNode Combine Nearby Masks
+### RefineNode Slice And Match Masks
 
-Groups close masks together without touching the image or paste-back metadata.
+Slices a single mask set or aligns two mask groups that describe the same product across different views, sizes, or proportions. The node preserves each group's original image size.
 
 Inputs:
 
-- `mask`: Input mask batch or mask list. All masks must have the same spatial size.
-- `max_gap`: Maximum bounding-box gap, in pixels, for two masks to be grouped. The default is `32`.
+- `mask1`: Optional first mask group. Output order is anchored to this group when both inputs are connected.
+- `mask2`: Optional second mask group to match against `mask1`.
+- `precision`: Coarse-to-fine slicing control from `0.0` to `1.0`. With one input, it controls that mask group's output. With two inputs, it controls the first mask group's output slots. `0.0` unions all mask components into one output mask. `1.0` keeps every disconnected component separate with no grouping. Middle values progressively merge more nearest-neighbor bbox groups.
+- `min_area_ratio`: Removes tiny disconnected components before grouping and matching. `0.0` disables filtering. Values are relative to the largest disconnected component in the same input group, so `0.02` removes components smaller than 2% of that largest component's foreground area.
 
 Outputs:
 
-- `mask`: A `MASK` batch where each output mask is the union of one nearby group.
+- `mask1`: First sliced/grouped mask batch.
+- `mask2`: Second mask batch aligned to `mask1`. When only one input is connected, this is an empty placeholder batch.
 
-Grouping is deterministic and transitive: if mask A is near B, and B is near C, A/B/C become one output mask. Distant groups remain separate.
+The node splits disconnected painted islands internally, removes components below `min_area_ratio`, and then applies grouping. For two-input matching, the second group is split and filtered independently, then assigned into the first group's output slots with row-aware order and normalized product position. If a first-group slot has no reliable second-group match, the second output keeps that slot empty instead of shifting the remaining masks. Use `precision=1.0` when the first mask group is already the exact granularity you want.
 
 ### RefineNode Preprocess Mask
 
@@ -96,7 +101,7 @@ Mask behavior:
 
 - `RefineNode Preprocess Mask` no longer decides whether masks should be split or combined.
 - A batched `MASK` input is treated as the exact refinement job list: one output image-list item per incoming mask, using the existing image/mask batch assignment rules.
-- Use `RefineNode Mask Batch Process` and `RefineNode Combine Nearby Masks` before this node when you need to split painted islands, combine all masks, or group nearby mask regions.
+- Use `RefineNode Slice And Match Masks` before this node when you need to split painted islands, combine all masks, group nearby mask regions, or align two mask groups.
 
 ### RefineNode Reference Image Process
 
@@ -126,6 +131,23 @@ Reference-based mode reminder:
 - Connect the target refinement image to `image1`.
 - Connect the reference image to `image2`.
 - Connect the target refinement mask/spatial mask image to `image3`.
+
+### RefineNode Restore Mask To Original
+
+Restores a mask detected on a cropped or resized RefineNode image back to the original image coordinate space.
+
+Inputs:
+
+- `mask`: Mask detected after `RefineNode Preprocess Mask` and, optionally, `RefineNode Reference Image Process`.
+- `info`: `REFINENODE_INFO` from `RefineNode Preprocess Mask` or the updated `info` from `RefineNode Reference Image Process`.
+
+Outputs:
+
+- `mask`: Restored mask in the original image size and position.
+
+Use this when you first crop a product with `RefineNode Preprocess Mask`, run another mask detector on the cropped/model image, and then need that newly detected mask to line up with the original uncropped image. If the image also passed through `RefineNode Reference Image Process`, the node reverses that resize/crop/fill transform before restoring the mask through the original `crop_box`.
+
+When the connected mask input contains multiple masks, such as the output from `RefineNode Slice And Match Masks`, every mask is restored. If there is only one `info` item, that same coordinate transform is reused for all mask outputs.
 
 ### RefineNode Paste Back
 
