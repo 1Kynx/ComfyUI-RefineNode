@@ -377,166 +377,6 @@ def image_batch_size(images: torch.Tensor | None) -> int:
     return 1
 
 
-def first_list_value(value: Any, default: Any = None) -> Any:
-    if isinstance(value, list):
-        return value[0] if value else default
-    return default if value is None else value
-
-
-def image_item_size(image: torch.Tensor) -> tuple[int, int]:
-    if image.ndim == 4:
-        return int(image.shape[2]), int(image.shape[1])
-    if image.ndim == 3:
-        return int(image.shape[1]), int(image.shape[0])
-    raise ValueError(f"Expected IMAGE tensor with 3 or 4 dims, got {tuple(image.shape)}")
-
-
-def split_image_input(images: torch.Tensor | list[torch.Tensor] | None) -> list[torch.Tensor]:
-    if images is None:
-        return []
-    values = images if isinstance(images, list) else [images]
-    items = []
-    for value in values:
-        if value is None:
-            continue
-        if value.ndim == 4:
-            for index in range(value.shape[0]):
-                items.append(value[index : index + 1])
-        elif value.ndim == 3:
-            items.append(value.unsqueeze(0))
-        else:
-            raise ValueError(f"Expected IMAGE tensor with 3 or 4 dims, got {tuple(value.shape)}")
-    return items
-
-
-def split_info_input(info: dict[str, Any] | list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-    if info is None:
-        return []
-    values = info if isinstance(info, list) else [info]
-    infos = []
-    for value in values:
-        if not isinstance(value, dict):
-            continue
-        items = value.get("items")
-        if isinstance(items, list) and len(items) > 1:
-            for item in items:
-                split_value = value.copy()
-                split_value["items"] = [item]
-                infos.append(split_value)
-        else:
-            infos.append(value)
-    return infos
-
-
-def index_sequence(target_count: int, candidate_count: int) -> list[int | None]:
-    if candidate_count <= 0:
-        return [None] * target_count
-    return [min(index, candidate_count - 1) for index in range(target_count)]
-
-
-def image_match_score(target_size: tuple[int, int], candidate_size: tuple[int, int]) -> tuple[float, float]:
-    target_width, target_height = target_size
-    candidate_width, candidate_height = candidate_size
-    target_ratio = math.log(max(target_width, 1) / max(target_height, 1))
-    candidate_ratio = math.log(max(candidate_width, 1) / max(candidate_height, 1))
-    target_area = math.log(max(target_width * target_height, 1))
-    candidate_area = math.log(max(candidate_width * candidate_height, 1))
-    return abs(target_ratio - candidate_ratio), abs(target_area - candidate_area)
-
-
-def match_image_indices(
-    targets: list[torch.Tensor],
-    candidates: list[torch.Tensor],
-    match_mode: str,
-) -> list[int | None]:
-    target_count = len(targets)
-    candidate_count = len(candidates)
-    if target_count <= 0:
-        return []
-    if candidate_count <= 0:
-        return [None] * target_count
-
-    mode = (match_mode or "index").strip().lower()
-    if mode != "aspect_ratio":
-        return index_sequence(target_count, candidate_count)
-
-    target_sizes = [image_item_size(item) for item in targets]
-    candidate_sizes = [image_item_size(item) for item in candidates]
-    if candidate_count == 1:
-        return [0] * target_count
-    if candidate_count == target_count and all(target_sizes[i] == candidate_sizes[i] for i in range(target_count)):
-        return index_sequence(target_count, candidate_count)
-    if len(set(candidate_sizes)) <= 1:
-        return index_sequence(target_count, candidate_count)
-
-    def nearest_candidate(target_index: int) -> int:
-        target_size = target_sizes[target_index]
-        return min(
-            range(candidate_count),
-            key=lambda candidate_index: (
-                *image_match_score(target_size, candidate_sizes[candidate_index]),
-                target_index,
-                candidate_index,
-            ),
-        )
-
-    if candidate_count < target_count:
-        return [nearest_candidate(target_index) for target_index in range(target_count)]
-
-    pairs = []
-    for target_index, target_size in enumerate(target_sizes):
-        for candidate_index, candidate_size in enumerate(candidate_sizes):
-            pairs.append(
-                (
-                    *image_match_score(target_size, candidate_size),
-                    target_index,
-                    candidate_index,
-                )
-            )
-    pairs.sort()
-
-    matches: list[int | None] = [None] * target_count
-    used_candidates = set()
-    for _, _, target_index, candidate_index in pairs:
-        if matches[target_index] is not None or candidate_index in used_candidates:
-            continue
-        matches[target_index] = candidate_index
-        used_candidates.add(candidate_index)
-        if len(used_candidates) >= min(target_count, candidate_count):
-            break
-
-    for target_index, candidate_index in enumerate(matches):
-        if candidate_index is None:
-            matches[target_index] = nearest_candidate(target_index)
-    return matches
-
-
-def add_reference_match_metadata(
-    info: dict[str, Any],
-    match_mode: str,
-    matched_image2_index: int | None,
-    matched_image3_index: int | None,
-) -> dict[str, Any]:
-    if not isinstance(info, dict):
-        return info
-    items = info.get("items")
-    if not isinstance(items, list):
-        return info
-    updated_info = info.copy()
-    updated_items = []
-    for item in items:
-        if not isinstance(item, dict):
-            updated_items.append(item)
-            continue
-        updated = item.copy()
-        updated["reference_image_match_mode"] = match_mode
-        updated["matched_image2_index"] = matched_image2_index
-        updated["matched_image3_index"] = matched_image3_index
-        updated_items.append(updated)
-    updated_info["items"] = updated_items
-    return updated_info
-
-
 def tensor_image_as_list_item(image: Image.Image) -> torch.Tensor:
     return pil_to_tensor_image(image).unsqueeze(0)
 
@@ -944,7 +784,6 @@ class RefineNodeReferenceImageProcess:
                 "fit_kontext_size": ("BOOLEAN", {"default": True}),
                 "resize_method": (IMAGE_RESIZE_METHODS, {"default": "lanczos"}),
                 "crop_mode": (["crop", "disable", "fill"], {"default": "crop"}),
-                "list_match_mode": (["index", "aspect_ratio"], {"default": "index"}),
             },
             "optional": {
                 "image2": ("IMAGE",),
@@ -960,8 +799,6 @@ class RefineNodeReferenceImageProcess:
         "image3",
         "info",
     )
-    INPUT_IS_LIST = True
-    OUTPUT_IS_LIST = (True, True, True, True)
     FUNCTION = "process"
     CATEGORY = "RefineNode"
 
@@ -971,33 +808,23 @@ class RefineNodeReferenceImageProcess:
         fit_kontext_size: bool,
         resize_method: str,
         crop_mode: str,
-        list_match_mode: str = "index",
         image2: torch.Tensor | None = None,
         image3: torch.Tensor | None = None,
         info: dict[str, Any] | None = None,
     ):
-        fit_kontext_size = bool(first_list_value(fit_kontext_size, True))
-        resize_method = str(first_list_value(resize_method, DEFAULT_RESIZE_METHOD))
-        crop_mode = str(first_list_value(crop_mode, "crop"))
-        list_match_mode = str(first_list_value(list_match_mode, "index"))
-
-        image1_items = split_image_input(image1)
-        image2_items = split_image_input(image2)
-        image3_items = split_image_input(image3)
-        info_items = split_info_input(info)
-        if not image1_items:
-            raise ValueError("Missing input images.")
-
-        image2_matches = match_image_indices(image1_items, image2_items, list_match_mode)
-        image3_matches = match_image_indices(image1_items, image3_items, list_match_mode)
-
+        batch = max(image_batch_size(image1), image_batch_size(image2), image_batch_size(image3))
         image1_outputs = []
         image2_outputs = []
         image3_outputs = []
-        info_outputs = []
+        slot_transforms: dict[str, list[dict[str, Any] | None]] = {
+            "image1": [],
+            "image2": [],
+            "image3": [],
+        }
+        target_size = None
 
-        for index, image1_item in enumerate(image1_items):
-            samples1 = tensor_image_to_pil(image1_item, 0)
+        for index in range(batch):
+            samples1 = tensor_image_to_pil(image1, index)
             first = normalize_to_srgb(samples1)
             if fit_kontext_size:
                 width, height = flux_kontext_target_size(*first.size)
@@ -1006,31 +833,21 @@ class RefineNodeReferenceImageProcess:
                 width, height = calculate_dimensions_area(VAE_IMAGE_SIZE, first.size[0], first.size[1], 8)
                 sizing_mode = "area_1024"
 
+            if target_size is None:
+                target_size = (width, height)
+            elif (width, height) != target_size:
+                raise ValueError(
+                    "Batch items resolve to different Flux Kontext sizes. "
+                    "Split the batch or use images with the same aspect ratio."
+                )
+
             processed = []
-            slot_transforms: dict[str, list[dict[str, Any] | None]] = {
-                "image1": [],
-                "image2": [],
-                "image3": [],
-            }
-            matched_image2_index = image2_matches[index] if index < len(image2_matches) else None
-            matched_image3_index = image3_matches[index] if index < len(image3_matches) else None
-            slot_inputs = (
-                ("image1", image1_item),
-                (
-                    "image2",
-                    image2_items[matched_image2_index] if matched_image2_index is not None else None,
-                ),
-                (
-                    "image3",
-                    image3_items[matched_image3_index] if matched_image3_index is not None else None,
-                ),
-            )
-            for slot, image in slot_inputs:
+            for slot, image in (("image1", image1), ("image2", image2), ("image3", image3)):
                 if image is None:
                     slot_transforms[slot].append(None)
-                    processed.append(image1_item.detach().new_zeros((1, height, width, 3)))
+                    processed.append(image1.detach().new_zeros((height, width, 3)))
                     continue
-                source_pil = normalize_to_srgb(tensor_image_to_pil(image, 0))
+                source_pil = normalize_to_srgb(tensor_image_to_pil(image, index))
                 slot_transforms[slot].append(
                     reference_image_transform_metadata(
                         source_pil.size,
@@ -1043,7 +860,7 @@ class RefineNodeReferenceImageProcess:
                 )
                 sample = image.detach()
                 if sample.ndim == 4:
-                    sample = sample[:1]
+                    sample = sample[min(index, sample.shape[0] - 1)].unsqueeze(0)
                 elif sample.ndim == 3:
                     sample = sample.unsqueeze(0)
                 else:
@@ -1054,27 +871,20 @@ class RefineNodeReferenceImageProcess:
                     raise ValueError(f"Expected IMAGE tensor channel count 3, got {sample.shape[-1]}")
                 sample = sample.movedim(-1, 1)
                 out = upscale_to_kontext_size(sample, width, height, resize_method, crop_mode).movedim(1, -1)
-                processed.append(out)
+                processed.append(out[0])
 
             image1_outputs.append(processed[0])
             image2_outputs.append(processed[1])
             image3_outputs.append(processed[2])
-            item_info = info_items[min(index, len(info_items) - 1)] if info_items else None
-            updated_info = update_info_with_kontext_transforms(item_info, slot_transforms)
-            info_outputs.append(
-                add_reference_match_metadata(
-                    updated_info,
-                    (list_match_mode or "index").strip().lower(),
-                    matched_image2_index,
-                    matched_image3_index,
-                )
-            )
+
+        if target_size is None:
+            raise ValueError("Missing input images.")
 
         return (
-            image1_outputs,
-            image2_outputs,
-            image3_outputs,
-            info_outputs,
+            torch.stack(image1_outputs, dim=0),
+            torch.stack(image2_outputs, dim=0),
+            torch.stack(image3_outputs, dim=0),
+            update_info_with_kontext_transforms(info, slot_transforms),
         )
 
 

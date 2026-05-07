@@ -924,7 +924,7 @@
       ],
       "size": [
         340,
-        290
+        260
       ],
       "flags": {},
       "order": 9,
@@ -994,8 +994,7 @@
       "widgets_values": [
         false,
         "lanczos",
-        "crop",
-        "index"
+        "crop"
       ]
     },
     {
