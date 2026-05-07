@@ -24,6 +24,10 @@ RefineAnything LoRA:
 
 You can try different options in the `Edit Model Reference Method` node, but it is best to avoid `index_timestep_zero` because it can introduce a noticeable color shift.
 
+For workflows with several painted regions, insert the mask-only nodes before `RefineNode Preprocess Mask`:
+
+`Load Image mask` -> `RefineNode Mask Batch Process` -> optional `RefineNode Combine Nearby Masks` -> `RefineNode Preprocess Mask`
+
 `example_workflows/Reference-based Logo Refinement.json`
 
 - Reference-based workflow for refining logos, text, or product details with a clean reference image.
@@ -39,6 +43,36 @@ You can try different options in the `Edit Model Reference Method` node, but it 
 
 ## Node Details
 
+### RefineNode Mask Batch Process
+
+Prepares a `MASK` tensor before it is sent into `RefineNode Preprocess Mask`.
+
+Inputs:
+
+- `mask`: Input mask. This can be a normal mask, a batched mask, or a ComfyUI mask list.
+- `combined_mask`: When disabled, each disconnected painted island is split into a separate mask in the output batch. When enabled, all incoming masks are unioned into one mask.
+
+Outputs:
+
+- `mask`: A processed `MASK` batch.
+
+Use this node when a single `Load Image` mask contains multiple separated painted regions and you want either one refinement job per region or one combined refinement job.
+
+### RefineNode Combine Nearby Masks
+
+Groups close masks together without touching the image or paste-back metadata.
+
+Inputs:
+
+- `mask`: Input mask batch or mask list. All masks must have the same spatial size.
+- `max_gap`: Maximum bounding-box gap, in pixels, for two masks to be grouped. The default is `32`.
+
+Outputs:
+
+- `mask`: A `MASK` batch where each output mask is the union of one nearby group.
+
+Grouping is deterministic and transitive: if mask A is near B, and B is near C, A/B/C become one output mask. Distant groups remain separate.
+
 ### RefineNode Preprocess Mask
 
 Prepares the target image and optional mask before model inference, and creates the `info` data required for accurate paste-back.
@@ -50,7 +84,6 @@ Inputs:
 - `focus_crop`: When enabled, crops around the masked region to reduce unrelated image area before generation.
 - `focus_crop_margin`: Extra context retained around the mask crop.
 - `spatial_prompt_source`: Controls the `spatial_mask_image` output. `mask` keeps the original mask shape, while `bbox` uses the mask bounding box.
-- `combined_mask`: When disabled, a multi-mask `MASK` input is expanded into separate image-list refinement jobs. This also splits disconnected painted mask islands from a single `Load Image` mask. When enabled, all masks for each source image are combined into one union mask before preprocessing.
 
 Outputs:
 
@@ -59,10 +92,11 @@ Outputs:
 - `mask`: Mask aligned with the output `image`.
 - `info`: Metadata containing the original image, crop position, mask, and paste-back coordinates. Pass this to downstream paste-back nodes.
 
-Multi-mask behavior:
+Mask behavior:
 
-- With `combined_mask` disabled, one input image plus multiple masks becomes an image list: one refinement job per mask or disconnected painted mask island.
-- With `combined_mask` enabled, multiple masks are merged first and only one refinement job is created per source image.
+- `RefineNode Preprocess Mask` no longer decides whether masks should be split or combined.
+- A batched `MASK` input is treated as the exact refinement job list: one output image-list item per incoming mask, using the existing image/mask batch assignment rules.
+- Use `RefineNode Mask Batch Process` and `RefineNode Combine Nearby Masks` before this node when you need to split painted islands, combine all masks, or group nearby mask regions.
 
 ### RefineNode Reference Image Process
 

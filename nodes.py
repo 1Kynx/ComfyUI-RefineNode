@@ -285,6 +285,21 @@ def combine_masks(masks: torch.Tensor, indices: list[int], size: tuple[int, int]
     return Image.fromarray(combined, mode="L")
 
 
+def union_mask_images(mask_images: list[Image.Image], size: tuple[int, int] | None = None) -> Image.Image:
+    if not mask_images:
+        if size is None:
+            raise ValueError("Cannot union an empty mask list without a target size.")
+        return Image.new("L", size, 0)
+    target_size = size or mask_images[0].size
+    combined = np.zeros((target_size[1], target_size[0]), dtype=np.uint8)
+    for mask_l in mask_images:
+        current = mask_l.convert("L")
+        if current.size != target_size:
+            current = current.resize(target_size, _NEAREST)
+        combined = np.maximum(combined, np.asarray(current, dtype=np.uint8))
+    return Image.fromarray(combined, mode="L")
+
+
 def connected_component_labels(binary: np.ndarray) -> tuple[np.ndarray, int]:
     binary_u8 = binary.astype(np.uint8, copy=False)
     try:
@@ -350,6 +365,56 @@ def split_mask_components(mask_l: Image.Image) -> list[Image.Image]:
         )
     components.sort(key=lambda item: (item[0], item[1]))
     return [component for _, _, component in components]
+
+
+def flatten_mask_input(masks: torch.Tensor | list[torch.Tensor]) -> list[Image.Image]:
+    values = masks if isinstance(masks, list) else [masks]
+    mask_images = []
+    expected_size = None
+    for value in values:
+        if value is None:
+            continue
+        count = mask_batch_size(value)
+        if count <= 0:
+            continue
+        if value.ndim == 2:
+            size = (int(value.shape[1]), int(value.shape[0]))
+        elif value.ndim == 3 and value.shape[-1] == 1 and value.shape[0] > 4 and value.shape[1] > 4:
+            size = (int(value.shape[1]), int(value.shape[0]))
+        elif value.ndim == 4:
+            size = (int(value.shape[2]), int(value.shape[1]))
+        else:
+            size = (int(value.shape[-1]), int(value.shape[-2]))
+        for index in range(count):
+            mask_l = tensor_mask_to_pil(value, index, size)
+            if expected_size is None:
+                expected_size = mask_l.size
+            elif mask_l.size != expected_size:
+                raise ValueError("All input masks must have the same size.")
+            mask_images.append(mask_l)
+    if not mask_images:
+        raise ValueError("Missing input mask.")
+    return mask_images
+
+
+def stack_mask_images(mask_images: list[Image.Image]) -> torch.Tensor:
+    if not mask_images:
+        raise ValueError("Cannot output an empty mask batch.")
+    size = mask_images[0].size
+    normalized = []
+    for mask_l in mask_images:
+        if mask_l.size != size:
+            raise ValueError("All output masks must have the same size.")
+        normalized.append(pil_to_tensor_mask(mask_l))
+    return torch.stack(normalized, dim=0)
+
+
+def bbox_gap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> int:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    dx = max(bx1 - ax2, ax1 - bx2, 0)
+    dy = max(by1 - ay2, ay1 - by2, 0)
+    return max(int(dx), int(dy))
 
 
 def pil_to_tensor_image(image: Image.Image) -> torch.Tensor:
@@ -606,6 +671,108 @@ def restore_generated_to_model_space(
     return generated.resize(model_image.size, _BICUBIC)
 
 
+class RefineNodeMaskBatchProcess:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask": ("MASK",),
+                "combined_mask": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    INPUT_IS_LIST = True
+    FUNCTION = "process"
+    CATEGORY = "RefineNode/Mask"
+
+    def process(self, mask: torch.Tensor | list[torch.Tensor], combined_mask: bool | list[bool]):
+        combined_mask = bool(combined_mask[0]) if isinstance(combined_mask, list) else bool(combined_mask)
+        mask_images = flatten_mask_input(mask)
+        size = mask_images[0].size
+
+        if combined_mask:
+            return (stack_mask_images([union_mask_images(mask_images, size)]),)
+
+        output_masks = []
+        for mask_l in mask_images:
+            components = split_mask_components(mask_l)
+            if components:
+                output_masks.extend(components)
+
+        if not output_masks:
+            output_masks = [Image.new("L", size, 0)]
+
+        return (stack_mask_images(output_masks),)
+
+
+class RefineNodeCombineNearbyMasks:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "mask": ("MASK",),
+                "max_gap": ("INT", {"default": 32, "min": 0, "max": 4096}),
+            },
+        }
+
+    RETURN_TYPES = ("MASK",)
+    RETURN_NAMES = ("mask",)
+    INPUT_IS_LIST = True
+    FUNCTION = "combine"
+    CATEGORY = "RefineNode/Mask"
+
+    def combine(self, mask: torch.Tensor | list[torch.Tensor], max_gap: int | list[int]):
+        max_gap = int(max_gap[0]) if isinstance(max_gap, list) else int(max_gap)
+        mask_images = flatten_mask_input(mask)
+        size = mask_images[0].size
+        entries = []
+        for index, mask_l in enumerate(mask_images):
+            bbox = bbox_from_mask_or_none(mask_l)
+            if bbox is not None:
+                entries.append((index, mask_l, bbox))
+
+        if not entries:
+            return (stack_mask_images([Image.new("L", size, 0)]),)
+
+        parents = list(range(len(entries)))
+
+        def find(index: int) -> int:
+            while parents[index] != index:
+                parents[index] = parents[parents[index]]
+                index = parents[index]
+            return index
+
+        def union(a: int, b: int) -> None:
+            root_a = find(a)
+            root_b = find(b)
+            if root_a == root_b:
+                return
+            if root_a < root_b:
+                parents[root_b] = root_a
+            else:
+                parents[root_a] = root_b
+
+        for left_index in range(len(entries)):
+            for right_index in range(left_index + 1, len(entries)):
+                if bbox_gap(entries[left_index][2], entries[right_index][2]) <= max_gap:
+                    union(left_index, right_index)
+
+        groups: dict[int, list[Image.Image]] = {}
+        first_indices: dict[int, int] = {}
+        for entry_index, (original_index, mask_l, _) in enumerate(entries):
+            root = find(entry_index)
+            groups.setdefault(root, []).append(mask_l)
+            first_indices[root] = min(first_indices.get(root, original_index), original_index)
+
+        output_masks = [
+            union_mask_images(groups[root], size)
+            for root in sorted(groups, key=lambda value: first_indices[value])
+        ]
+        return (stack_mask_images(output_masks),)
+
+
 class RefineNodePreprocessMask:
     @classmethod
     def INPUT_TYPES(cls):
@@ -615,7 +782,6 @@ class RefineNodePreprocessMask:
                 "focus_crop": ("BOOLEAN", {"default": True}),
                 "focus_crop_margin": ("INT", {"default": 64, "min": 0, "max": 2048}),
                 "spatial_prompt_source": (["mask", "bbox"], {"default": "mask"}),
-                "combined_mask": ("BOOLEAN", {"default": False}),
             },
             "optional": {
                 "mask": ("MASK",),
@@ -634,7 +800,6 @@ class RefineNodePreprocessMask:
         focus_crop: bool,
         focus_crop_margin: int,
         spatial_prompt_source: str,
-        combined_mask: bool = False,
         mask: torch.Tensor | None = None,
     ):
         image_count = image_batch_size(image)
@@ -650,9 +815,6 @@ class RefineNodePreprocessMask:
             source_image_index: int,
             mask_index: int | None,
             mask_indices: list[int],
-            component_index: int | None,
-            component_count: int,
-            is_combined: bool,
         ) -> None:
             bbox_raw = bbox_from_mask_or_none(mask_l)
             has_region = bbox_raw is not None
@@ -691,10 +853,10 @@ class RefineNodePreprocessMask:
                     "source_image_index": int(source_image_index),
                     "mask_index": None if mask_index is None else int(mask_index),
                     "mask_indices": [int(value) for value in mask_indices],
-                    "component_index": None if component_index is None else int(component_index),
-                    "component_count": int(component_count),
+                    "component_index": None,
+                    "component_count": 0,
                     "group_id": group_id,
-                    "combined_mask": bool(is_combined),
+                    "combined_mask": False,
                 }
             )
 
@@ -707,9 +869,6 @@ class RefineNodePreprocessMask:
                     image_index,
                     None,
                     [],
-                    None,
-                    0,
-                    bool(combined_mask),
                 )
                 continue
 
@@ -721,51 +880,18 @@ class RefineNodePreprocessMask:
                     image_index,
                     None,
                     [],
-                    None,
-                    0,
-                    bool(combined_mask),
-                )
-                continue
-            if combined_mask:
-                append_job(
-                    original,
-                    combine_masks(mask, indices, original.size),
-                    image_index,
-                    None,
-                    indices,
-                    None,
-                    1,
-                    True,
                 )
                 continue
 
             for mask_index in indices:
                 mask_l = tensor_mask_to_pil(mask, mask_index, original.size)
-                components = split_mask_components(mask_l)
-                if not components:
-                    append_job(
-                        original,
-                        mask_l,
-                        image_index,
-                        mask_index,
-                        [mask_index],
-                        None,
-                        0,
-                        False,
-                    )
-                    continue
-                component_count = len(components)
-                for component_index, component_mask in enumerate(components):
-                    append_job(
-                        original,
-                        component_mask,
-                        image_index,
-                        mask_index,
-                        [mask_index],
-                        component_index,
-                        component_count,
-                        False,
-                    )
+                append_job(
+                    original,
+                    mask_l,
+                    image_index,
+                    mask_index,
+                    [mask_index],
+                )
 
         return (
             model_images,
@@ -1042,12 +1168,16 @@ def focus_crop_region(
 
 
 NODE_CLASS_MAPPINGS = {
+    "RefineNodeMaskBatchProcess": RefineNodeMaskBatchProcess,
+    "RefineNodeCombineNearbyMasks": RefineNodeCombineNearbyMasks,
     "RefineNodePreprocessMask": RefineNodePreprocessMask,
     "RefineNodeReferenceImageProcess": RefineNodeReferenceImageProcess,
     "RefineNodePasteBack": RefineNodePasteBack,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
+    "RefineNodeMaskBatchProcess": "RefineNode Mask Batch Process",
+    "RefineNodeCombineNearbyMasks": "RefineNode Combine Nearby Masks",
     "RefineNodePreprocessMask": "RefineNode Preprocess Mask",
     "RefineNodeReferenceImageProcess": "RefineNode Reference Image Process",
     "RefineNodePasteBack": "RefineNode Paste Back",
