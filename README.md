@@ -50,7 +50,7 @@ Inputs:
 - `focus_crop`: When enabled, crops around the masked region to reduce unrelated image area before generation.
 - `focus_crop_margin`: Extra context retained around the mask crop.
 - `spatial_prompt_source`: Controls the `spatial_mask_image` output. `mask` keeps the original mask shape, while `bbox` uses the mask bounding box.
-- `combined_mask`: When disabled, a multi-mask `MASK` input is expanded into separate image-list refinement jobs. When enabled, all masks for each source image are combined into one union mask before preprocessing.
+- `combined_mask`: When disabled, a multi-mask `MASK` input is expanded into separate image-list refinement jobs. This also splits disconnected painted mask islands from a single `Load Image` mask. When enabled, all masks for each source image are combined into one union mask before preprocessing.
 
 Outputs:
 
@@ -61,7 +61,7 @@ Outputs:
 
 Multi-mask behavior:
 
-- With `combined_mask` disabled, one input image plus multiple masks becomes an image list: one refinement job per mask.
+- With `combined_mask` disabled, one input image plus multiple masks becomes an image list: one refinement job per mask or disconnected painted mask island.
 - With `combined_mask` enabled, multiple masks are merged first and only one refinement job is created per source image.
 
 ### RefineNode Reference Image Process

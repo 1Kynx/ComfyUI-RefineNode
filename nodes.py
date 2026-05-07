@@ -285,6 +285,73 @@ def combine_masks(masks: torch.Tensor, indices: list[int], size: tuple[int, int]
     return Image.fromarray(combined, mode="L")
 
 
+def connected_component_labels(binary: np.ndarray) -> tuple[np.ndarray, int]:
+    binary_u8 = binary.astype(np.uint8, copy=False)
+    try:
+        import cv2
+
+        label_count, labels = cv2.connectedComponents(binary_u8, connectivity=8)
+        return labels.astype(np.int32, copy=False), max(0, int(label_count) - 1)
+    except Exception:
+        pass
+
+    try:
+        from scipy import ndimage
+
+        labels, label_count = ndimage.label(binary_u8, structure=np.ones((3, 3), dtype=np.uint8))
+        return labels.astype(np.int32, copy=False), int(label_count)
+    except Exception:
+        pass
+
+    height, width = binary_u8.shape
+    labels = np.zeros((height, width), dtype=np.int32)
+    label_count = 0
+    ys, xs = np.nonzero(binary_u8)
+    for start_y, start_x in zip(ys.tolist(), xs.tolist()):
+        if labels[start_y, start_x] != 0:
+            continue
+        label_count += 1
+        labels[start_y, start_x] = label_count
+        stack = [(int(start_y), int(start_x))]
+        while stack:
+            y, x = stack.pop()
+            for ny in range(max(0, y - 1), min(height, y + 2)):
+                for nx in range(max(0, x - 1), min(width, x + 2)):
+                    if labels[ny, nx] == 0 and binary_u8[ny, nx]:
+                        labels[ny, nx] = label_count
+                        stack.append((ny, nx))
+    return labels, label_count
+
+
+def split_mask_components(mask_l: Image.Image) -> list[Image.Image]:
+    arr = np.asarray(mask_l.convert("L"), dtype=np.uint8)
+    binary = arr > 0
+    if not binary.any():
+        return []
+
+    labels, label_count = connected_component_labels(binary)
+    if label_count <= 1:
+        return [mask_l.convert("L")]
+
+    components = []
+    for label in range(1, label_count + 1):
+        component_pixels = labels == label
+        if not component_pixels.any():
+            continue
+        ys, xs = np.nonzero(component_pixels)
+        component = np.zeros_like(arr)
+        component[component_pixels] = arr[component_pixels]
+        components.append(
+            (
+                int(ys.min()),
+                int(xs.min()),
+                Image.fromarray(component, mode="L"),
+            )
+        )
+    components.sort(key=lambda item: (item[0], item[1]))
+    return [component for _, _, component in components]
+
+
 def pil_to_tensor_image(image: Image.Image) -> torch.Tensor:
     arr = np.asarray(image.convert("RGB")).astype(np.float32) / 255.0
     return torch.from_numpy(arr)
@@ -583,6 +650,8 @@ class RefineNodePreprocessMask:
             source_image_index: int,
             mask_index: int | None,
             mask_indices: list[int],
+            component_index: int | None,
+            component_count: int,
             is_combined: bool,
         ) -> None:
             bbox_raw = bbox_from_mask_or_none(mask_l)
@@ -622,6 +691,8 @@ class RefineNodePreprocessMask:
                     "source_image_index": int(source_image_index),
                     "mask_index": None if mask_index is None else int(mask_index),
                     "mask_indices": [int(value) for value in mask_indices],
+                    "component_index": None if component_index is None else int(component_index),
+                    "component_count": int(component_count),
                     "group_id": group_id,
                     "combined_mask": bool(is_combined),
                 }
@@ -636,6 +707,8 @@ class RefineNodePreprocessMask:
                     image_index,
                     None,
                     [],
+                    None,
+                    0,
                     bool(combined_mask),
                 )
                 continue
@@ -648,6 +721,8 @@ class RefineNodePreprocessMask:
                     image_index,
                     None,
                     [],
+                    None,
+                    0,
                     bool(combined_mask),
                 )
                 continue
@@ -658,19 +733,39 @@ class RefineNodePreprocessMask:
                     image_index,
                     None,
                     indices,
+                    None,
+                    1,
                     True,
                 )
                 continue
 
             for mask_index in indices:
-                append_job(
-                    original,
-                    tensor_mask_to_pil(mask, mask_index, original.size),
-                    image_index,
-                    mask_index,
-                    [mask_index],
-                    False,
-                )
+                mask_l = tensor_mask_to_pil(mask, mask_index, original.size)
+                components = split_mask_components(mask_l)
+                if not components:
+                    append_job(
+                        original,
+                        mask_l,
+                        image_index,
+                        mask_index,
+                        [mask_index],
+                        None,
+                        0,
+                        False,
+                    )
+                    continue
+                component_count = len(components)
+                for component_index, component_mask in enumerate(components):
+                    append_job(
+                        original,
+                        component_mask,
+                        image_index,
+                        mask_index,
+                        [mask_index],
+                        component_index,
+                        component_count,
+                        False,
+                    )
 
         return (
             model_images,
