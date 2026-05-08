@@ -24,12 +24,6 @@ RefineAnything LoRA:
 
 You can try different options in the `Edit Model Reference Method` node, but it is best to avoid `index_timestep_zero` because it can introduce a noticeable color shift.
 
-For workflows with several painted regions, insert the mask-only nodes before `RefineNode Preprocess Mask`:
-
-`Load Image mask` -> optional `RefineNode Slice And Match Masks` -> `RefineNode Preprocess Mask`
-
-For two mask groups from the same product, use `RefineNode Slice And Match Masks` to align their output count and order before preprocessing.
-
 `example_workflows/Reference-based Logo Refinement.json`
 
 - Reference-based workflow for refining logos, text, or product details with a clean reference image.
