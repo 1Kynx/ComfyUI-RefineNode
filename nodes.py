@@ -522,8 +522,13 @@ def slice_masks_by_product_bbox(
     if mask1_bbox is None:
         return ([Image.new("L", mask1_size, 0)], [Image.new("L", mask2_size, 0)])
 
-    if auto_match_orientation and (mask1_bbox[2] - mask1_bbox[0]) > (mask1_bbox[3] - mask1_bbox[1]):
-        rows, columns = columns, rows
+    if auto_match_orientation and rows != columns:
+        long_count = max(rows, columns)
+        short_count = min(rows, columns)
+        if (mask1_bbox[2] - mask1_bbox[0]) > (mask1_bbox[3] - mask1_bbox[1]):
+            rows, columns = short_count, long_count
+        else:
+            rows, columns = long_count, short_count
 
     cells = normalized_grid_cells(rows, columns)
 
