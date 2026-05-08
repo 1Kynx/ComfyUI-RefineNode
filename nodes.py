@@ -422,6 +422,127 @@ def split_mask_images_to_components(mask_images: list[Image.Image], min_area_rat
     return [Image.new("L", mask_images[0].size, 0)]
 
 
+def filtered_union_mask(mask_images: list[Image.Image], min_area_ratio: float = 0.0) -> Image.Image:
+    components = split_mask_images_to_components(mask_images, min_area_ratio)
+    return binary_mask(union_mask_images(components, mask_images[0].size))
+
+
+def clamp_int_value(value: int | float | list[int] | list[float], default: int, min_value: int, max_value: int) -> int:
+    if isinstance(value, list):
+        value = value[0] if value else default
+    try:
+        number = int(round(float(value)))
+    except (TypeError, ValueError):
+        number = default
+    return max(min_value, min(max_value, number))
+
+
+def normalize_choice(value: str | list[str], default: str, choices: set[str]) -> str:
+    if isinstance(value, list):
+        value = value[0] if value else default
+    text = str(value or default).strip().lower()
+    return text if text in choices else default
+
+
+def normalized_grid_cells(rows: int, columns: int) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    return [
+        (
+            (row / rows, (row + 1) / rows),
+            (column / columns, (column + 1) / columns),
+        )
+        for row in range(rows)
+        for column in range(columns)
+    ]
+
+
+def bbox_grid_cell_box(
+    bbox: tuple[int, int, int, int],
+    row_interval: tuple[float, float],
+    column_interval: tuple[float, float],
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = bbox
+    width = max(1, x2 - x1)
+    height = max(1, y2 - y1)
+    row_start, row_end = row_interval
+    column_start, column_end = column_interval
+    sx = x1 + int(math.floor(width * column_start))
+    ex = x1 + int(math.ceil(width * column_end))
+    sy = y1 + int(math.floor(height * row_start))
+    ey = y1 + int(math.ceil(height * row_end))
+    return (
+        sx,
+        sy,
+        max(sx + 1, min(x2, ex)),
+        max(sy + 1, min(y2, ey)),
+    )
+
+
+def intersect_mask_with_bbox(mask_l: Image.Image, bbox: tuple[int, int, int, int]) -> Image.Image:
+    stripe = bbox_mask(mask_l.size, bbox)
+    mask_arr = np.asarray(binary_mask(mask_l), dtype=np.uint8)
+    stripe_arr = np.asarray(stripe, dtype=np.uint8)
+    return Image.fromarray(np.minimum(mask_arr, stripe_arr), mode="L")
+
+
+def bbox_grid_sliced_masks(
+    mask_l: Image.Image,
+    bbox: tuple[int, int, int, int] | None,
+    cells: list[tuple[tuple[float, float], tuple[float, float]]],
+    output_mode: str,
+) -> list[Image.Image]:
+    if bbox is None:
+        return [Image.new("L", mask_l.size, 0) for _ in cells]
+
+    output = []
+    for row_interval, column_interval in cells:
+        slice_box = bbox_grid_cell_box(bbox, row_interval, column_interval)
+        if output_mode == "bbox":
+            output.append(bbox_mask(mask_l.size, slice_box))
+        else:
+            output.append(intersect_mask_with_bbox(mask_l, slice_box))
+    return output
+
+
+def slice_masks_by_product_bbox(
+    mask1_images: list[Image.Image],
+    mask2_images: list[Image.Image] | None,
+    min_area_ratio: float,
+    rows: int,
+    columns: int,
+    output_mode: str,
+) -> tuple[list[Image.Image], list[Image.Image]]:
+    mask1_union = filtered_union_mask(mask1_images, min_area_ratio)
+    mask1_bbox = bbox_from_mask_or_none(mask1_union)
+    mask1_size = mask1_union.size
+    mask2_size = mask2_images[0].size if mask2_images else mask1_size
+
+    if mask1_bbox is None:
+        return ([Image.new("L", mask1_size, 0)], [Image.new("L", mask2_size, 0)])
+
+    cells = normalized_grid_cells(rows, columns)
+
+    mask1_slices = bbox_grid_sliced_masks(mask1_union, mask1_bbox, cells, output_mode)
+    keep_indices = list(range(len(mask1_slices)))
+    if output_mode == "mask":
+        non_empty_indices = [
+            index
+            for index, slice_mask in enumerate(mask1_slices)
+            if bbox_from_mask_or_none(slice_mask) is not None
+        ]
+        keep_indices = non_empty_indices or [0]
+
+    kept_mask1 = [mask1_slices[index] for index in keep_indices]
+
+    if not mask2_images:
+        return (kept_mask1, [Image.new("L", mask1_size, 0) for _ in kept_mask1])
+
+    mask2_union = filtered_union_mask(mask2_images, min_area_ratio)
+    mask2_bbox = bbox_from_mask_or_none(mask2_union)
+    mask2_slices = bbox_grid_sliced_masks(mask2_union, mask2_bbox, cells, output_mode)
+    kept_mask2 = [mask2_slices[index] for index in keep_indices]
+    return (kept_mask1, kept_mask2)
+
+
 def flatten_mask_input(masks: torch.Tensor | list[torch.Tensor]) -> list[Image.Image]:
     values = masks if isinstance(masks, list) else [masks]
     mask_images = []
@@ -457,25 +578,6 @@ def stack_mask_images(mask_images: list[Image.Image]) -> torch.Tensor:
     return torch.stack(normalized, dim=0)
 
 
-def bbox_gap(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> int:
-    ax1, ay1, ax2, ay2 = a
-    bx1, by1, bx2, by2 = b
-    dx = max(bx1 - ax2, ax1 - bx2, 0)
-    dy = max(by1 - ay2, ay1 - by2, 0)
-    return max(int(dx), int(dy))
-
-
-def union_bbox(bboxes: list[tuple[int, int, int, int]]) -> tuple[int, int, int, int] | None:
-    if not bboxes:
-        return None
-    return (
-        min(box[0] for box in bboxes),
-        min(box[1] for box in bboxes),
-        max(box[2] for box in bboxes),
-        max(box[3] for box in bboxes),
-    )
-
-
 def clamp_unit_float(value: float | int | list[float] | list[int], default: float = 1.0) -> float:
     if isinstance(value, list):
         value = value[0] if value else default
@@ -484,333 +586,6 @@ def clamp_unit_float(value: float | int | list[float] | list[int], default: floa
     except (TypeError, ValueError):
         number = default
     return max(0.0, min(1.0, number))
-
-
-def clamp_precision(value: float | int | list[float] | list[int]) -> float:
-    return clamp_unit_float(value, 1.0)
-
-
-def group_entries_by_mst_precision(
-    entries: list[tuple[int, Image.Image, tuple[int, int, int, int]]],
-    precision: float,
-) -> dict[int, list[Image.Image]]:
-    parents = list(range(len(entries)))
-
-    def find(index: int) -> int:
-        while parents[index] != index:
-            parents[index] = parents[parents[index]]
-            index = parents[index]
-        return index
-
-    def merge(a: int, b: int) -> bool:
-        root_a = find(a)
-        root_b = find(b)
-        if root_a == root_b:
-            return False
-        if root_a < root_b:
-            parents[root_b] = root_a
-        else:
-            parents[root_a] = root_b
-        return True
-
-    edges = []
-    for left_index in range(len(entries)):
-        for right_index in range(left_index + 1, len(entries)):
-            gap = bbox_gap(entries[left_index][2], entries[right_index][2])
-            edges.append((gap, left_index, right_index))
-    edges.sort(key=lambda item: (item[0], item[1], item[2]))
-
-    mst_edges = []
-    mst_parents = list(range(len(entries)))
-
-    def mst_find(index: int) -> int:
-        while mst_parents[index] != index:
-            mst_parents[index] = mst_parents[mst_parents[index]]
-            index = mst_parents[index]
-        return index
-
-    def mst_merge(a: int, b: int) -> bool:
-        root_a = mst_find(a)
-        root_b = mst_find(b)
-        if root_a == root_b:
-            return False
-        if root_a < root_b:
-            mst_parents[root_b] = root_a
-        else:
-            mst_parents[root_a] = root_b
-        return True
-
-    for gap, left_index, right_index in edges:
-        if mst_merge(left_index, right_index):
-            mst_edges.append((gap, left_index, right_index))
-            if len(mst_edges) == len(entries) - 1:
-                break
-
-    remaining_edges = [edge for edge in mst_edges if edge[0] > 0]
-    if precision <= 0.0:
-        selected_edges = mst_edges
-    else:
-        extra_count = int(round((1.0 - precision) * len(remaining_edges)))
-        selected_edges = remaining_edges[:extra_count]
-
-    for _, left_index, right_index in selected_edges:
-        merge(left_index, right_index)
-
-    groups: dict[int, list[Image.Image]] = {}
-    first_indices: dict[int, int] = {}
-    for entry_index, (original_index, mask_l, _) in enumerate(entries):
-        root = find(entry_index)
-        groups.setdefault(root, []).append(mask_l)
-        first_indices[root] = min(first_indices.get(root, original_index), original_index)
-    return {
-        root: groups[root]
-        for root in sorted(groups, key=lambda value: first_indices[value])
-    }
-
-
-def group_mask_images_by_precision(
-    mask_images: list[Image.Image],
-    precision: float,
-    split_components: bool = True,
-    min_area_ratio: float = 0.0,
-) -> list[Image.Image]:
-    if not mask_images:
-        raise ValueError("Missing input mask.")
-    if split_components:
-        mask_images = split_mask_images_to_components(mask_images, min_area_ratio)
-    size = mask_images[0].size
-    if precision <= 0.0:
-        return [union_mask_images(mask_images, size)]
-    entries = []
-    for index, mask_l in enumerate(mask_images):
-        bbox = bbox_from_mask_or_none(mask_l)
-        if bbox is not None:
-            entries.append((index, mask_l, bbox))
-    if not entries:
-        return [Image.new("L", size, 0)]
-    if len(entries) == 1:
-        return [entries[0][1].convert("L")]
-    groups = group_entries_by_mst_precision(entries, precision)
-    return [union_mask_images(group, size) for group in groups.values()]
-
-
-def mask_feature_in_group(
-    mask_l: Image.Image,
-    bbox: tuple[int, int, int, int] | None,
-    group_bbox: tuple[int, int, int, int],
-) -> dict[str, Any]:
-    group_width = max(1, group_bbox[2] - group_bbox[0])
-    group_height = max(1, group_bbox[3] - group_bbox[1])
-    group_area = max(1, group_width * group_height)
-    if bbox is None:
-        return {
-            "bbox": None,
-            "center_x": 0.5,
-            "center_y": 0.5,
-            "x1": 0.5,
-            "y1": 0.5,
-            "x2": 0.5,
-            "y2": 0.5,
-            "width": 0.0,
-            "height": 0.0,
-            "area": 0.0,
-            "aspect": 1.0,
-        }
-    x1, y1, x2, y2 = bbox
-    width = max(1, x2 - x1)
-    height = max(1, y2 - y1)
-    area = float((np.asarray(mask_l.convert("L"), dtype=np.uint8) > 0).sum())
-    return {
-        "bbox": bbox,
-        "center_x": (((x1 + x2) / 2.0) - group_bbox[0]) / group_width,
-        "center_y": (((y1 + y2) / 2.0) - group_bbox[1]) / group_height,
-        "x1": (x1 - group_bbox[0]) / group_width,
-        "y1": (y1 - group_bbox[1]) / group_height,
-        "x2": (x2 - group_bbox[0]) / group_width,
-        "y2": (y2 - group_bbox[1]) / group_height,
-        "width": width / group_width,
-        "height": height / group_height,
-        "area": area / group_area,
-        "aspect": width / height,
-    }
-
-
-def mask_match_features(mask_images: list[Image.Image]) -> list[dict[str, Any]]:
-    bboxes = [bbox_from_mask_or_none(mask_l) for mask_l in mask_images]
-    active_bboxes = [bbox for bbox in bboxes if bbox is not None]
-    group_bbox = union_bbox(active_bboxes)
-    if group_bbox is None:
-        group_bbox = (0, 0, max(1, mask_images[0].size[0]), max(1, mask_images[0].size[1]))
-    return [mask_feature_in_group(mask_l, bbox, group_bbox) for mask_l, bbox in zip(mask_images, bboxes)]
-
-
-def mask_feature_match_score(anchor: dict[str, Any], candidate: dict[str, Any]) -> float:
-    if anchor["bbox"] is None and candidate["bbox"] is None:
-        return 0.0
-    if anchor["bbox"] is None or candidate["bbox"] is None:
-        return 1_000_000.0
-
-    center_distance = math.hypot(anchor["center_x"] - candidate["center_x"], anchor["center_y"] - candidate["center_y"])
-    area_distance = abs(math.log((candidate["area"] + 1e-6) / (anchor["area"] + 1e-6)))
-    aspect_distance = abs(math.log((candidate["aspect"] + 1e-6) / (anchor["aspect"] + 1e-6)))
-    size_distance = abs(anchor["width"] - candidate["width"]) + abs(anchor["height"] - candidate["height"])
-    y_distance = abs(anchor["center_y"] - candidate["center_y"])
-    x_distance = abs(anchor["center_x"] - candidate["center_x"])
-    y_span_distance = abs(anchor["y1"] - candidate["y1"]) + abs(anchor["y2"] - candidate["y2"])
-    x_span_distance = abs(anchor["x1"] - candidate["x1"]) + abs(anchor["x2"] - candidate["x2"])
-    return (
-        y_distance * 10.0
-        + y_span_distance * 8.0
-        + x_distance * 1.5
-        + x_span_distance * 0.5
-        + center_distance * 0.5
-        + area_distance * 0.2
-        + aspect_distance * 0.1
-        + size_distance * 0.35
-    )
-
-
-def empty_anchor_cost(anchor: dict[str, Any]) -> float:
-    if anchor["bbox"] is None:
-        return 0.0
-    return 0.45 + min(1.75, anchor["area"] * 10.0) + anchor["height"] * 0.75 + anchor["width"] * 0.15
-
-
-def ordered_mask_feature_indices(features: list[dict[str, Any]], indices: list[int]) -> list[int]:
-    if not indices:
-        return []
-
-    heights = [features[index]["height"] for index in indices if features[index]["bbox"] is not None]
-    median_height = float(np.median(heights)) if heights else 0.03
-    row_gap = max(0.01, min(0.08, median_height * 1.25))
-    rows: list[dict[str, Any]] = []
-
-    for index in sorted(indices, key=lambda value: (features[value]["center_y"], features[value]["center_x"], value)):
-        feature = features[index]
-        y1 = feature["y1"]
-        y2 = feature["y2"]
-        feature_height = max(1e-6, feature["height"])
-        is_tall_component = feature_height > median_height * 2.5
-        best_row = None
-        best_distance = float("inf")
-        for row_index, row in enumerate(rows):
-            distance = abs(feature["center_y"] - row["center_y"])
-            row_height = max(1e-6, row["y2"] - row["y1"])
-            overlap = max(0.0, min(y2, row["y2"]) - max(y1, row["y1"]))
-            overlap_ratio = overlap / max(1e-6, min(feature_height, row_height))
-            same_row = distance <= row_gap
-            if not is_tall_component:
-                same_row = same_row or overlap_ratio >= 0.45
-            if same_row and distance < best_distance:
-                best_row = row_index
-                best_distance = distance
-        if best_row is None:
-            rows.append(
-                {
-                    "indices": [index],
-                    "y1": y1,
-                    "y2": y2,
-                    "center_y": feature["center_y"],
-                }
-            )
-            continue
-
-        row = rows[best_row]
-        row["indices"].append(index)
-        row["y1"] = min(row["y1"], y1)
-        row["y2"] = max(row["y2"], y2)
-        row["center_y"] = sum(features[value]["center_y"] for value in row["indices"]) / len(row["indices"])
-
-    ordered = []
-    for row in sorted(rows, key=lambda item: (item["center_y"], item["y1"])):
-        ordered.extend(sorted(row["indices"], key=lambda value: (features[value]["center_x"], features[value]["center_y"], value)))
-    return ordered
-
-
-def match_candidates_to_anchors(anchor_masks: list[Image.Image], candidate_masks: list[Image.Image]) -> list[Image.Image]:
-    if not anchor_masks:
-        raise ValueError("Missing anchor masks.")
-    if not candidate_masks:
-        return [Image.new("L", anchor_masks[0].size, 0) for _ in anchor_masks]
-
-    output_size = candidate_masks[0].size
-    anchor_features = mask_match_features(anchor_masks)
-    candidate_features = mask_match_features(candidate_masks)
-    active_anchor_indices = [index for index, feature in enumerate(anchor_features) if feature["bbox"] is not None]
-    active_candidate_indices = [index for index, feature in enumerate(candidate_features) if feature["bbox"] is not None]
-    if not active_anchor_indices:
-        return [Image.new("L", output_size, 0) for _ in anchor_masks]
-    if not active_candidate_indices:
-        return [Image.new("L", output_size, 0) for _ in anchor_masks]
-
-    assignments: dict[int, list[Image.Image]] = {index: [] for index in range(len(anchor_masks))}
-    ordered_anchors = ordered_mask_feature_indices(anchor_features, active_anchor_indices)
-    ordered_candidates = ordered_mask_feature_indices(candidate_features, active_candidate_indices)
-
-    candidate_group_bbox = union_bbox(
-        [candidate_features[index]["bbox"] for index in ordered_candidates if candidate_features[index]["bbox"] is not None]
-    )
-    if candidate_group_bbox is None:
-        candidate_group_bbox = (0, 0, output_size[0], output_size[1])
-    segment_cache: dict[tuple[int, int, int], tuple[float, Image.Image]] = {}
-
-    def segment_cost(anchor_index: int, start: int, end: int) -> tuple[float, Image.Image]:
-        key = (anchor_index, start, end)
-        if key in segment_cache:
-            return segment_cache[key]
-        segment_masks = [candidate_masks[ordered_candidates[index]] for index in range(start, end)]
-        segment_mask = union_mask_images(segment_masks, output_size)
-        segment_bbox = bbox_from_mask_or_none(segment_mask)
-        segment_feature = mask_feature_in_group(segment_mask, segment_bbox, candidate_group_bbox)
-        merge_penalty = max(0, end - start - 1) * 0.03
-        cost = mask_feature_match_score(anchor_features[anchor_index], segment_feature) + merge_penalty
-        segment_cache[key] = (cost, segment_mask)
-        return cost, segment_mask
-
-    anchor_count = len(ordered_anchors)
-    candidate_count = len(ordered_candidates)
-    inf = float("inf")
-    dp = [[inf] * (candidate_count + 1) for _ in range(anchor_count + 1)]
-    prev: list[list[tuple[str, int] | None]] = [[None] * (candidate_count + 1) for _ in range(anchor_count + 1)]
-    dp[0][0] = 0.0
-
-    for anchor_pos in range(anchor_count):
-        anchor_index = ordered_anchors[anchor_pos]
-        for used_candidates in range(candidate_count + 1):
-            current = dp[anchor_pos][used_candidates]
-            if current == inf:
-                continue
-
-            empty_total = current + empty_anchor_cost(anchor_features[anchor_index])
-            if empty_total < dp[anchor_pos + 1][used_candidates]:
-                dp[anchor_pos + 1][used_candidates] = empty_total
-                prev[anchor_pos + 1][used_candidates] = ("empty", used_candidates)
-
-            for end in range(used_candidates + 1, candidate_count + 1):
-                cost, _ = segment_cost(anchor_index, used_candidates, end)
-                total = current + cost
-                if total < dp[anchor_pos + 1][end]:
-                    dp[anchor_pos + 1][end] = total
-                    prev[anchor_pos + 1][end] = ("segment", used_candidates)
-
-    used_candidates = candidate_count
-    for anchor_pos in range(anchor_count, 0, -1):
-        action = prev[anchor_pos][used_candidates]
-        if action is None:
-            break
-        kind, start = action
-        anchor_index = ordered_anchors[anchor_pos - 1]
-        if kind == "segment":
-            _, segment_mask = segment_cost(anchor_index, start, used_candidates)
-            assignments[anchor_index].append(segment_mask)
-        used_candidates = start
-
-    return [
-        union_mask_images(assignments[index], output_size)
-        if assignments[index]
-        else Image.new("L", output_size, 0)
-        for index in range(len(anchor_masks))
-    ]
 
 
 def pil_to_tensor_image(image: Image.Image) -> torch.Tensor:
@@ -1157,8 +932,10 @@ class RefineNodeSliceAndMatchMasks:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "precision": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "min_area_ratio": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "min_area_ratio": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "rows": ("INT", {"default": 4, "min": 1, "max": 16}),
+                "columns": ("INT", {"default": 1, "min": 1, "max": 16}),
+                "output_mode": (["mask", "bbox"], {"default": "bbox"}),
             },
             "optional": {
                 "mask1": ("MASK",),
@@ -1174,39 +951,33 @@ class RefineNodeSliceAndMatchMasks:
 
     def process(
         self,
-        precision: float | list[float],
         min_area_ratio: float | list[float],
+        rows: int | list[int],
+        columns: int | list[int],
+        output_mode: str | list[str],
         mask1: torch.Tensor | list[torch.Tensor] | None = None,
         mask2: torch.Tensor | list[torch.Tensor] | None = None,
     ):
-        precision = clamp_precision(precision)
-        min_area_ratio = clamp_unit_float(min_area_ratio, 0.0)
+        min_area_ratio = clamp_unit_float(min_area_ratio, 0.01)
+        rows = clamp_int_value(rows, 4, 1, 16)
+        columns = clamp_int_value(columns, 1, 1, 16)
+        output_mode = normalize_choice(output_mode, "bbox", {"mask", "bbox"})
         if mask1 is None and mask2 is None:
             raise ValueError("Connect at least one mask input.")
         if mask1 is None:
             mask1 = mask2
             mask2 = None
         mask1_images = flatten_mask_input(mask1)
-
-        if mask2 is None:
-            grouped_masks = group_mask_images_by_precision(
-                mask1_images,
-                precision,
-                min_area_ratio=min_area_ratio,
-            )
-            empty_masks = [Image.new("L", grouped_masks[0].size, 0) for _ in grouped_masks]
-            return (stack_mask_images(grouped_masks), stack_mask_images(empty_masks))
-
-        mask2_images = flatten_mask_input(mask2)
-        anchor_masks = group_mask_images_by_precision(
+        mask2_images = flatten_mask_input(mask2) if mask2 is not None else None
+        sliced_mask1, sliced_mask2 = slice_masks_by_product_bbox(
             mask1_images,
-            precision,
-            min_area_ratio=min_area_ratio,
+            mask2_images,
+            min_area_ratio,
+            rows,
+            columns,
+            output_mode,
         )
-        candidate_masks = split_mask_images_to_components(mask2_images, min_area_ratio)
-
-        matched_mask2 = match_candidates_to_anchors(anchor_masks, candidate_masks)
-        return (stack_mask_images(anchor_masks), stack_mask_images(matched_mask2))
+        return (stack_mask_images(sliced_mask1), stack_mask_images(sliced_mask2))
 
 
 class RefineNodePreprocessMask:

@@ -62,21 +62,23 @@ Use this node when a single `Load Image` mask contains multiple separated painte
 
 ### RefineNode Slice And Match Masks
 
-Slices a single mask set or aligns two mask groups that describe the same product across different views, sizes, or proportions. The node preserves each group's original image size.
+Slices a single mask set or aligns two mask groups that describe the same product across different views, sizes, or proportions. The node uses the whole filtered product mask bbox as the anchor, then applies the same normalized row/column bbox grid to the second mask group. Each group's original image size is preserved.
 
 Inputs:
 
 - `mask1`: Optional first mask group. Output order is anchored to this group when both inputs are connected.
 - `mask2`: Optional second mask group to match against `mask1`.
-- `precision`: Coarse-to-fine slicing control from `0.0` to `1.0` with `0.01` step precision. With one input, it controls that mask group's output. With two inputs, it controls the first mask group's output slots. `0.0` unions all mask components into one output mask. `1.0` keeps every disconnected component separate with no grouping. Middle values progressively merge more nearest-neighbor bbox groups.
-- `min_area_ratio`: Removes tiny disconnected components before grouping and matching, with `0.01` step precision. `0.0` disables filtering. Values are relative to the largest disconnected component in the same input group, so `0.02` removes components smaller than 2% of that largest component's foreground area.
+- `min_area_ratio`: Removes tiny disconnected components before grouping and matching, with `0.01` step precision. Default is `0.01`; `0.0` disables filtering. Values are relative to the largest disconnected component in the same input group, so `0.02` removes components smaller than 2% of that largest component's foreground area.
+- `rows`: Number of equal-height bbox grid rows. Default is `4`.
+- `columns`: Number of equal-width bbox grid columns. Default is `1`.
+- `output_mode`: `mask` keeps the original product mask shape inside each bbox slice. `bbox` outputs full rectangular bbox slices for the most stable spatial correspondence. Default is `bbox`.
 
 Outputs:
 
 - `mask1`: First sliced/grouped mask batch.
 - `mask2`: Second mask batch aligned to `mask1`. When only one input is connected, this is an empty placeholder batch.
 
-The node splits disconnected painted islands internally, removes components below `min_area_ratio`, and then applies `precision` grouping. For two-input matching, the second group is split and filtered independently, then assigned into the first group's output slots with row-aware order and normalized product position. If a first-group slot has no reliable second-group match, the second output keeps that slot empty instead of shifting the remaining masks. Use `precision=1.0` when the first mask group is already the exact granularity you want.
+The node splits disconnected painted islands internally, removes components below `min_area_ratio`, unions the remaining regions into one product mask, and slices that product bbox into a row-major grid: top to bottom, left to right. In `mask` mode, empty `mask1` cells are skipped and `mask2` keeps the same remaining cell positions. In `bbox` mode, the full `rows × columns` rectangular grid is preserved. Use `rows=4, columns=1` for vertical product labels, `rows=1, columns=4` for horizontal labels, and multiple rows and columns for two-dimensional local regions.
 
 ### RefineNode Preprocess Mask
 
