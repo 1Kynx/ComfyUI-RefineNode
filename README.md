@@ -62,17 +62,52 @@ Inputs:
 
 - `mask1`: Optional first mask group. Output order is anchored to this group when both inputs are connected.
 - `mask2`: Optional second mask group to match against `mask1`.
+- `output_mode`: `mask` keeps the original product mask shape inside each bbox slice. `bbox` outputs full rectangular bbox slices for the most stable spatial correspondence. Default is `bbox`.
 - `min_area_ratio`: Removes tiny disconnected components before grouping and matching, with `0.01` step precision. Default is `0.01`; `0.0` disables filtering. Values are relative to the largest disconnected component in the same input group, so `0.02` removes components smaller than 2% of that largest component's foreground area.
 - `rows`: Number of equal-height bbox grid rows. Default is `4`.
 - `columns`: Number of equal-width bbox grid columns. Default is `1`.
-- `output_mode`: `mask` keeps the original product mask shape inside each bbox slice. `bbox` outputs full rectangular bbox slices for the most stable spatial correspondence. Default is `bbox`.
+- `auto_match_orientation`: Automatically swaps `rows` and `columns` for horizontal `mask1` product bboxes. Default is enabled.
 
 Outputs:
 
 - `mask1`: First sliced/grouped mask batch.
 - `mask2`: Second mask batch aligned to `mask1`. When only one input is connected, this is an empty placeholder batch.
 
-The node splits disconnected painted islands internally, removes components below `min_area_ratio`, unions the remaining regions into one product mask, and slices that product bbox into a row-major grid: top to bottom, left to right. In `mask` mode, empty `mask1` cells are skipped and `mask2` keeps the same remaining cell positions. In `bbox` mode, the full `rows × columns` rectangular grid is preserved. Use `rows=4, columns=1` for vertical product labels, `rows=1, columns=4` for horizontal labels, and multiple rows and columns for two-dimensional local regions.
+The node splits disconnected painted islands internally, removes components below `min_area_ratio`, unions the remaining regions into one product mask, and slices that product bbox into a row-major grid: top to bottom, left to right. When `auto_match_orientation` is enabled, `rows=4, columns=1` stays 4x1 for vertical products and becomes 1x4 for horizontal products. In `mask` mode, empty `mask1` cells are skipped and `mask2` keeps the same remaining cell positions. In `bbox` mode, the full `rows × columns` rectangular grid is preserved. Use multiple rows and columns for two-dimensional local regions.
+
+### RefineNode Match Product Angle
+
+Rotates one product image to match the main mask angle of a reference product mask. The node rotates the whole source image without scaling, rotates the source mask with the same angle, and crops the result to the rotated source mask bbox.
+
+Inputs:
+
+- `image`: Source product image to rotate.
+- `source_mask`: Product mask for the source image.
+- `reference_mask`: Product mask whose angle should be matched.
+- `canvas_expand`: Expands the output crop from the rotated product bbox toward the full rotated canvas. `0.0` keeps the tight product bbox crop; `1.0` keeps the full rotated canvas.
+
+Outputs:
+
+- `image`: Rotated RGB image cropped to the rotated source mask bbox.
+- `mask`: Rotated source mask cropped to the same bbox.
+- `angle`: Applied rotation angle in degrees.
+
+The angle is estimated from each mask's foreground principal axis. Empty source or reference masks return the original source image, the source mask, and `angle=0`. The node does not scale, perform perspective correction, or distinguish 0 degrees from 180 degrees.
+
+### RefineNode Rotate Image
+
+Rotates an image by a manually specified angle.
+
+Inputs:
+
+- `image`: Image to rotate.
+- `angle`: Rotation angle in degrees.
+
+Outputs:
+
+- `image`: Rotated RGB image.
+
+The image is rotated without scaling. The output canvas expands to contain the full rotated image, and newly exposed pixels are filled with black.
 
 ### RefineNode Preprocess Mask
 

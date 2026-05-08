@@ -215,8 +215,10 @@ def tensor_image_to_pil(images: torch.Tensor, index: int) -> Image.Image:
         raise ValueError(f"Expected IMAGE tensor with 3 or 4 dims, got {tuple(images.shape)}")
     if tensor.shape[-1] == 1:
         tensor = tensor.repeat(1, 1, 3)
+    elif tensor.shape[-1] == 4:
+        tensor = tensor[..., :3]
     if tensor.shape[-1] != 3:
-        raise ValueError(f"Expected IMAGE tensor channel count 3, got {tensor.shape[-1]}")
+        raise ValueError(f"Expected IMAGE tensor channel count 1, 3, or 4, got {tensor.shape[-1]}")
     arr = (tensor.clamp(0, 1).numpy() * 255.0 + 0.5).astype(np.uint8)
     return Image.fromarray(arr, mode="RGB")
 
@@ -509,6 +511,7 @@ def slice_masks_by_product_bbox(
     min_area_ratio: float,
     rows: int,
     columns: int,
+    auto_match_orientation: bool,
     output_mode: str,
 ) -> tuple[list[Image.Image], list[Image.Image]]:
     mask1_union = filtered_union_mask(mask1_images, min_area_ratio)
@@ -518,6 +521,9 @@ def slice_masks_by_product_bbox(
 
     if mask1_bbox is None:
         return ([Image.new("L", mask1_size, 0)], [Image.new("L", mask2_size, 0)])
+
+    if auto_match_orientation and (mask1_bbox[2] - mask1_bbox[0]) > (mask1_bbox[3] - mask1_bbox[1]):
+        rows, columns = columns, rows
 
     cells = normalized_grid_cells(rows, columns)
 
@@ -619,6 +625,89 @@ def tensor_image_as_list_item(image: Image.Image) -> torch.Tensor:
 
 def tensor_mask_as_list_item(mask_l: Image.Image) -> torch.Tensor:
     return pil_to_tensor_mask(mask_l).unsqueeze(0)
+
+
+def normalize_axis_angle(angle: float) -> float:
+    while angle < -90.0:
+        angle += 180.0
+    while angle >= 90.0:
+        angle -= 180.0
+    return angle
+
+
+def mask_principal_axis_angle(mask_l: Image.Image) -> float | None:
+    arr = np.asarray(mask_l.convert("L"), dtype=np.uint8) > 0
+    ys, xs = np.nonzero(arr)
+    if xs.size < 2:
+        return None
+    coords = np.stack([xs.astype(np.float64), -ys.astype(np.float64)], axis=1)
+    coords -= coords.mean(axis=0, keepdims=True)
+    cov = np.cov(coords, rowvar=False)
+    if not np.isfinite(cov).all():
+        return None
+    values, vectors = np.linalg.eigh(cov)
+    vector = vectors[:, int(np.argmax(values))]
+    if not np.isfinite(vector).all() or np.linalg.norm(vector) <= 1e-8:
+        return None
+    return normalize_axis_angle(math.degrees(math.atan2(float(vector[1]), float(vector[0]))))
+
+
+def rotated_product_crop(
+    image: Image.Image,
+    mask_l: Image.Image,
+    angle: float,
+    canvas_expand: float = 0.0,
+) -> tuple[Image.Image, Image.Image]:
+    rotated_image = image.convert("RGB").rotate(
+        angle,
+        resample=_BICUBIC,
+        expand=True,
+        fillcolor=(0, 0, 0),
+    )
+    rotated_mask = binary_mask(mask_l).rotate(
+        angle,
+        resample=_NEAREST,
+        expand=True,
+        fillcolor=0,
+    )
+    rotated_mask = binary_mask(rotated_mask)
+    bbox = bbox_from_mask_or_none(rotated_mask)
+    if bbox is None:
+        return rotated_image, rotated_mask
+    expand = max(0.0, min(1.0, float(canvas_expand)))
+    if expand <= 0.0:
+        crop_box = bbox
+    else:
+        canvas_w, canvas_h = rotated_image.size
+        x1, y1, x2, y2 = bbox
+        crop_box = (
+            max(0, int(math.floor(x1 * (1.0 - expand)))),
+            max(0, int(math.floor(y1 * (1.0 - expand)))),
+            min(canvas_w, int(math.ceil(x2 * (1.0 - expand) + canvas_w * expand))),
+            min(canvas_h, int(math.ceil(y2 * (1.0 - expand) + canvas_h * expand))),
+        )
+    return rotated_image.crop(crop_box), rotated_mask.crop(crop_box)
+
+
+def rotate_image_canvas(image: Image.Image, angle: float) -> Image.Image:
+    return image.convert("RGB").rotate(
+        float(angle),
+        resample=_BICUBIC,
+        expand=True,
+        fillcolor=(0, 0, 0),
+    )
+
+
+def stack_image_pils(images: list[Image.Image]) -> torch.Tensor:
+    if not images:
+        raise ValueError("Cannot output an empty image batch.")
+    size = images[0].size
+    if any(image.size != size for image in images):
+        raise ValueError(
+            "RefineNode Match Product Angle batch outputs have different crop sizes. "
+            "Split the batch or use inputs with matching rotated product bbox sizes."
+        )
+    return torch.stack([pil_to_tensor_image(image) for image in images], dim=0)
 
 
 def upscale_image(samples: torch.Tensor, width: int, height: int, method: str, crop: str = "disabled") -> torch.Tensor:
@@ -932,10 +1021,11 @@ class RefineNodeSliceAndMatchMasks:
     def INPUT_TYPES(cls):
         return {
             "required": {
+                "output_mode": (["mask", "bbox"], {"default": "bbox"}),
                 "min_area_ratio": ("FLOAT", {"default": 0.01, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "rows": ("INT", {"default": 4, "min": 1, "max": 16}),
                 "columns": ("INT", {"default": 1, "min": 1, "max": 16}),
-                "output_mode": (["mask", "bbox"], {"default": "bbox"}),
+                "auto_match_orientation": ("BOOLEAN", {"default": True}),
             },
             "optional": {
                 "mask1": ("MASK",),
@@ -954,6 +1044,7 @@ class RefineNodeSliceAndMatchMasks:
         min_area_ratio: float | list[float],
         rows: int | list[int],
         columns: int | list[int],
+        auto_match_orientation: bool | list[bool],
         output_mode: str | list[str],
         mask1: torch.Tensor | list[torch.Tensor] | None = None,
         mask2: torch.Tensor | list[torch.Tensor] | None = None,
@@ -961,6 +1052,7 @@ class RefineNodeSliceAndMatchMasks:
         min_area_ratio = clamp_unit_float(min_area_ratio, 0.01)
         rows = clamp_int_value(rows, 4, 1, 16)
         columns = clamp_int_value(columns, 1, 1, 16)
+        auto_match_orientation = bool(auto_match_orientation[0]) if isinstance(auto_match_orientation, list) else bool(auto_match_orientation)
         output_mode = normalize_choice(output_mode, "bbox", {"mask", "bbox"})
         if mask1 is None and mask2 is None:
             raise ValueError("Connect at least one mask input.")
@@ -975,9 +1067,98 @@ class RefineNodeSliceAndMatchMasks:
             min_area_ratio,
             rows,
             columns,
+            auto_match_orientation,
             output_mode,
         )
         return (stack_mask_images(sliced_mask1), stack_mask_images(sliced_mask2))
+
+
+class RefineNodeMatchProductAngle:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "source_mask": ("MASK",),
+                "reference_mask": ("MASK",),
+                "canvas_expand": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "FLOAT")
+    RETURN_NAMES = ("image", "mask", "angle")
+    OUTPUT_IS_LIST = (False, False, True)
+    FUNCTION = "match_angle"
+    CATEGORY = "RefineNode/Transform"
+
+    def match_angle(
+        self,
+        image: torch.Tensor,
+        source_mask: torch.Tensor,
+        reference_mask: torch.Tensor,
+        canvas_expand: float | int | list[float] | list[int],
+    ):
+        canvas_expand = clamp_unit_float(canvas_expand, 0.0)
+        batch = max(image_batch_size(image), mask_batch_size(source_mask), mask_batch_size(reference_mask))
+        reference_size = mask_tensor_spatial_size(reference_mask)
+        output_images: list[Image.Image] = []
+        output_masks: list[Image.Image] = []
+        angles: list[float] = []
+
+        for index in range(batch):
+            source_image = normalize_to_srgb(tensor_image_to_pil(image, index))
+            source_mask_l = tensor_mask_to_pil(source_mask, index, source_image.size)
+            reference_mask_l = tensor_mask_to_pil(reference_mask, index, reference_size)
+
+            source_angle = mask_principal_axis_angle(source_mask_l)
+            reference_angle = mask_principal_axis_angle(reference_mask_l)
+            if source_angle is None or reference_angle is None:
+                output_images.append(source_image)
+                output_masks.append(binary_mask(source_mask_l))
+                angles.append(0.0)
+                continue
+
+            angle = normalize_axis_angle(reference_angle - source_angle)
+            rotated_image, rotated_mask = rotated_product_crop(source_image, source_mask_l, angle, canvas_expand)
+            output_images.append(rotated_image)
+            output_masks.append(rotated_mask)
+            angles.append(float(angle))
+
+        return (stack_image_pils(output_images), stack_mask_images(output_masks), angles)
+
+
+class RefineNodeRotateImage:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "angle": ("FLOAT", {"default": 0.0, "min": -360.0, "max": 360.0, "step": 0.01}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "rotate"
+    CATEGORY = "RefineNode/Transform"
+
+    def rotate(
+        self,
+        image: torch.Tensor,
+        angle: float | int | list[float] | list[int],
+    ):
+        if isinstance(angle, list):
+            angle = angle[0] if angle else 0.0
+        try:
+            angle = float(angle)
+        except (TypeError, ValueError):
+            angle = 0.0
+
+        output_images = [
+            rotate_image_canvas(normalize_to_srgb(tensor_image_to_pil(image, index)), angle)
+            for index in range(image_batch_size(image))
+        ]
+        return (stack_image_pils(output_images),)
 
 
 class RefineNodePreprocessMask:
@@ -1200,8 +1381,10 @@ class RefineNodeReferenceImageProcess:
                     raise ValueError(f"Expected IMAGE tensor with 3 or 4 dims, got {tuple(image.shape)}")
                 if sample.shape[-1] == 1:
                     sample = sample.repeat(1, 1, 1, 3)
+                elif sample.shape[-1] == 4:
+                    sample = sample[..., :3]
                 if sample.shape[-1] != 3:
-                    raise ValueError(f"Expected IMAGE tensor channel count 3, got {sample.shape[-1]}")
+                    raise ValueError(f"Expected IMAGE tensor channel count 1, 3, or 4, got {sample.shape[-1]}")
                 sample = sample.movedim(-1, 1)
                 out = upscale_to_kontext_size(sample, width, height, resize_method, crop_mode).movedim(1, -1)
                 processed.append(out[0])
@@ -1430,6 +1613,8 @@ def focus_crop_region(
 NODE_CLASS_MAPPINGS = {
     "RefineNodeMaskBatchProcess": RefineNodeMaskBatchProcess,
     "RefineNodeSliceAndMatchMasks": RefineNodeSliceAndMatchMasks,
+    "RefineNodeMatchProductAngle": RefineNodeMatchProductAngle,
+    "RefineNodeRotateImage": RefineNodeRotateImage,
     "RefineNodePreprocessMask": RefineNodePreprocessMask,
     "RefineNodeReferenceImageProcess": RefineNodeReferenceImageProcess,
     "RefineNodeRestoreMaskToOriginal": RefineNodeRestoreMaskToOriginal,
@@ -1439,6 +1624,8 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "RefineNodeMaskBatchProcess": "RefineNode Mask Batch Process",
     "RefineNodeSliceAndMatchMasks": "RefineNode Slice And Match Masks",
+    "RefineNodeMatchProductAngle": "RefineNode Match Product Angle",
+    "RefineNodeRotateImage": "RefineNode Rotate Image",
     "RefineNodePreprocessMask": "RefineNode Preprocess Mask",
     "RefineNodeReferenceImageProcess": "RefineNode Reference Image Process",
     "RefineNodeRestoreMaskToOriginal": "RefineNode Restore Mask To Original",
