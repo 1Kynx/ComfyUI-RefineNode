@@ -67,13 +67,14 @@ Inputs:
 - `rows`: Number of equal-height bbox grid rows. Default is `4`.
 - `columns`: Number of equal-width bbox grid columns. Default is `1`.
 - `auto_match_orientation`: Automatically makes the longer split direction follow the longer side of the `mask1` product bbox. Default is enabled.
+- `individual_masks`: Treats each `mask2` input mask as a separate product and repeats the same `mask1` sliced reference for every `mask2` product. Default is disabled.
 
 Outputs:
 
 - `mask1`: First sliced/grouped mask batch.
 - `mask2`: Second mask batch aligned to `mask1`. When only one input is connected, this is an empty placeholder batch.
 
-The node splits disconnected painted islands internally, removes components below `min_area_ratio`, unions the remaining regions into one product mask, and slices that product bbox into a row-major grid: top to bottom, left to right. When `auto_match_orientation` is enabled, the larger of `rows` and `columns` follows the longer side of the product bbox: `rows=4, columns=1` stays 4x1 for vertical products and becomes 1x4 for horizontal products, while `rows=1, columns=3` becomes 3x1 for vertical products and stays 1x3 for horizontal products. In `mask` mode, empty `mask1` cells are skipped and `mask2` keeps the same remaining cell positions. In `bbox` mode, the full `rows × columns` rectangular grid is preserved. Use multiple rows and columns for two-dimensional local regions.
+The node splits disconnected painted islands internally, removes components below `min_area_ratio`, unions the remaining regions into one product mask, and slices that product bbox into a row-major grid: top to bottom, left to right. When `auto_match_orientation` is enabled, the larger of `rows` and `columns` follows the longer side of the product bbox: `rows=4, columns=1` stays 4x1 for vertical products and becomes 1x4 for horizontal products, while `rows=1, columns=3` becomes 3x1 for vertical products and stays 1x3 for horizontal products. When `individual_masks` is enabled, `mask2` is not unioned into one bbox; each `mask2` product gets its own matched output set using the same `mask1` reference slices. In `mask` mode, empty `mask1` cells are skipped and `mask2` keeps the same remaining cell positions. In `bbox` mode, the full `rows × columns` rectangular grid is preserved. Use multiple rows and columns for two-dimensional local regions.
 
 ### RefineNode Match Product Angle
 
