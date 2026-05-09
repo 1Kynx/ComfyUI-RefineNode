@@ -505,14 +505,13 @@ def bbox_grid_sliced_masks(
     return output
 
 
-def slice_masks_by_product_bbox(
+def slice_mask_pair_by_product_bbox(
     mask1_images: list[Image.Image],
     mask2_images: list[Image.Image] | None,
     min_area_ratio: float,
     rows: int,
     columns: int,
     auto_match_orientation: bool,
-    individual_masks: bool,
     output_mode: str,
 ) -> tuple[list[Image.Image], list[Image.Image]]:
     mask1_union = filtered_union_mask(mask1_images, min_area_ratio)
@@ -548,22 +547,86 @@ def slice_masks_by_product_bbox(
     if not mask2_images:
         return (kept_mask1, [Image.new("L", mask1_size, 0) for _ in kept_mask1])
 
-    if individual_masks:
-        repeated_mask1: list[Image.Image] = []
-        kept_mask2: list[Image.Image] = []
-        for mask2_image in mask2_images:
-            mask2_union = filtered_union_mask([mask2_image], min_area_ratio)
-            mask2_bbox = bbox_from_mask_or_none(mask2_union)
-            mask2_slices = bbox_grid_sliced_masks(mask2_union, mask2_bbox, cells, output_mode)
-            repeated_mask1.extend(mask.copy() for mask in kept_mask1)
-            kept_mask2.extend(mask2_slices[index] for index in keep_indices)
-        return (repeated_mask1, kept_mask2)
-
     mask2_union = filtered_union_mask(mask2_images, min_area_ratio)
     mask2_bbox = bbox_from_mask_or_none(mask2_union)
     mask2_slices = bbox_grid_sliced_masks(mask2_union, mask2_bbox, cells, output_mode)
     kept_mask2 = [mask2_slices[index] for index in keep_indices]
     return (kept_mask1, kept_mask2)
+
+
+def slice_masks_by_product_bbox(
+    mask1_images: list[Image.Image],
+    mask2_images: list[Image.Image] | None,
+    min_area_ratio: float,
+    rows: int,
+    columns: int,
+    auto_match_orientation: bool,
+    match_mode: str,
+    output_mode: str,
+) -> tuple[list[Image.Image], list[Image.Image]]:
+    if match_mode == "repeat_mask1" and mask2_images:
+        output_mask1: list[Image.Image] = []
+        output_mask2: list[Image.Image] = []
+        for mask2_image in mask2_images:
+            pair_mask1, pair_mask2 = slice_mask_pair_by_product_bbox(
+                mask1_images,
+                [mask2_image],
+                min_area_ratio,
+                rows,
+                columns,
+                auto_match_orientation,
+                output_mode,
+            )
+            output_mask1.extend(pair_mask1)
+            output_mask2.extend(pair_mask2)
+        return output_mask1, output_mask2
+
+    if match_mode == "pair_by_index":
+        if not mask2_images:
+            output_mask1: list[Image.Image] = []
+            output_mask2: list[Image.Image] = []
+            for mask1_image in mask1_images:
+                pair_mask1, pair_mask2 = slice_mask_pair_by_product_bbox(
+                    [mask1_image],
+                    None,
+                    min_area_ratio,
+                    rows,
+                    columns,
+                    auto_match_orientation,
+                    output_mode,
+                )
+                output_mask1.extend(pair_mask1)
+                output_mask2.extend(pair_mask2)
+            return output_mask1, output_mask2
+
+        output_mask1 = []
+        output_mask2 = []
+        count = max(len(mask1_images), len(mask2_images))
+        for index in range(count):
+            mask1_image = mask1_images[min(index, len(mask1_images) - 1)]
+            mask2_image = mask2_images[min(index, len(mask2_images) - 1)]
+            pair_mask1, pair_mask2 = slice_mask_pair_by_product_bbox(
+                [mask1_image],
+                [mask2_image],
+                min_area_ratio,
+                rows,
+                columns,
+                auto_match_orientation,
+                output_mode,
+            )
+            output_mask1.extend(pair_mask1)
+            output_mask2.extend(pair_mask2)
+        return output_mask1, output_mask2
+
+    return slice_mask_pair_by_product_bbox(
+        mask1_images,
+        mask2_images,
+        min_area_ratio,
+        rows,
+        columns,
+        auto_match_orientation,
+        output_mode,
+    )
 
 
 def flatten_mask_input(masks: torch.Tensor | list[torch.Tensor]) -> list[Image.Image]:
@@ -1043,7 +1106,7 @@ class RefineNodeSliceAndMatchMasks:
                 "rows": ("INT", {"default": 4, "min": 1, "max": 16}),
                 "columns": ("INT", {"default": 1, "min": 1, "max": 16}),
                 "auto_match_orientation": ("BOOLEAN", {"default": True}),
-                "individual_masks": ("BOOLEAN", {"default": False}),
+                "match_mode": (["union", "repeat_mask1", "pair_by_index"], {"default": "union"}),
             },
             "optional": {
                 "mask1": ("MASK",),
@@ -1063,7 +1126,7 @@ class RefineNodeSliceAndMatchMasks:
         rows: int | list[int],
         columns: int | list[int],
         auto_match_orientation: bool | list[bool],
-        individual_masks: bool | list[bool],
+        match_mode: str | list[str],
         output_mode: str | list[str],
         mask1: torch.Tensor | list[torch.Tensor] | None = None,
         mask2: torch.Tensor | list[torch.Tensor] | None = None,
@@ -1072,7 +1135,7 @@ class RefineNodeSliceAndMatchMasks:
         rows = clamp_int_value(rows, 4, 1, 16)
         columns = clamp_int_value(columns, 1, 1, 16)
         auto_match_orientation = bool(auto_match_orientation[0]) if isinstance(auto_match_orientation, list) else bool(auto_match_orientation)
-        individual_masks = bool(individual_masks[0]) if isinstance(individual_masks, list) else bool(individual_masks)
+        match_mode = normalize_choice(match_mode, "union", {"union", "repeat_mask1", "pair_by_index"})
         output_mode = normalize_choice(output_mode, "bbox", {"mask", "bbox"})
         if mask1 is None and mask2 is None:
             raise ValueError("Connect at least one mask input.")
@@ -1088,7 +1151,7 @@ class RefineNodeSliceAndMatchMasks:
             rows,
             columns,
             auto_match_orientation,
-            individual_masks,
+            match_mode,
             output_mode,
         )
         return (stack_mask_images(sliced_mask1), stack_mask_images(sliced_mask2))
