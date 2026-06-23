@@ -69,7 +69,7 @@ class RefineNodeSliceAndMatchMasks:
                 "rows": ("INT", {"default": 4, "min": 1, "max": 16}),
                 "columns": ("INT", {"default": 1, "min": 1, "max": 16}),
                 "auto_match_orientation": ("BOOLEAN", {"default": True}),
-                "match_mode": (["union", "repeat_mask1", "pair_by_index"], {"default": "union"}),
+                "match_mode": (["union", "repeat_mask1", "pair_by_index", "pair_by_position"], {"default": "union"}),
             },
             "optional": {
                 "mask1": ("MASK",),
@@ -98,7 +98,7 @@ class RefineNodeSliceAndMatchMasks:
         rows = clamp_int_value(rows, 4, 1, 16)
         columns = clamp_int_value(columns, 1, 1, 16)
         auto_match_orientation = bool(auto_match_orientation[0]) if isinstance(auto_match_orientation, list) else bool(auto_match_orientation)
-        match_mode = normalize_choice(match_mode, "union", {"union", "repeat_mask1", "pair_by_index"})
+        match_mode = normalize_choice(match_mode, "union", {"union", "repeat_mask1", "pair_by_index", "pair_by_position"})
         output_mode = normalize_choice(output_mode, "bbox", {"mask", "bbox"})
         if mask1 is None and mask2 is None:
             refine_error("RefineNode Slice And Match Masks", "Connect at least one mask input.")

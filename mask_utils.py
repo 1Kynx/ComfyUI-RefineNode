@@ -441,6 +441,184 @@ def bbox_grid_sliced_masks(
     return output
 
 
+def product_mask_descriptors(mask_images: list[Image.Image], min_area_ratio: float) -> list[dict[str, Any]]:
+    descriptors: list[dict[str, Any]] = []
+    for index, mask_l in enumerate(mask_images):
+        filtered = filtered_union_mask([mask_l], min_area_ratio)
+        bbox = bbox_from_mask_or_none(filtered)
+        if bbox is None:
+            continue
+        x1, y1, x2, y2 = bbox
+        descriptors.append(
+            {
+                "index": index,
+                "mask": filtered,
+                "bbox": bbox,
+                "center_x": (x1 + x2) * 0.5,
+                "center_y": (y1 + y2) * 0.5,
+                "area": max(1, mask_foreground_area(filtered)),
+                "aspect": max(1e-6, (x2 - x1) / max(1, y2 - y1)),
+            }
+        )
+
+    if not descriptors:
+        return []
+
+    union_bbox = (
+        min(desc["bbox"][0] for desc in descriptors),
+        min(desc["bbox"][1] for desc in descriptors),
+        max(desc["bbox"][2] for desc in descriptors),
+        max(desc["bbox"][3] for desc in descriptors),
+    )
+    ux1, uy1, ux2, uy2 = union_bbox
+    union_width = max(1, ux2 - ux1)
+    union_height = max(1, uy2 - uy1)
+    union_area = max(1, union_width * union_height)
+    for desc in descriptors:
+        x1, y1, x2, y2 = desc["bbox"]
+        desc["norm_x"] = (desc["center_x"] - ux1) / union_width
+        desc["norm_y"] = (desc["center_y"] - uy1) / union_height
+        desc["norm_left"] = (x1 - ux1) / union_width
+        desc["norm_top"] = (y1 - uy1) / union_height
+        desc["norm_right"] = (x2 - ux1) / union_width
+        desc["norm_bottom"] = (y2 - uy1) / union_height
+        desc["norm_area"] = desc["area"] / union_area
+    return descriptors
+
+
+def spatially_order_product_descriptors(descriptors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for desc in sorted(descriptors, key=lambda item: (item["norm_y"], item["norm_x"], item["index"])):
+        placed = False
+        for row in rows:
+            overlap = min(desc["norm_bottom"], row["bottom"]) - max(desc["norm_top"], row["top"])
+            row_height = max(1e-6, row["bottom"] - row["top"])
+            desc_height = max(1e-6, desc["norm_bottom"] - desc["norm_top"])
+            center_delta = abs(desc["norm_y"] - row["center"])
+            if overlap >= -0.03 or center_delta <= max(0.08, 0.5 * max(row_height, desc_height)):
+                row["items"].append(desc)
+                row["top"] = min(row["top"], desc["norm_top"])
+                row["bottom"] = max(row["bottom"], desc["norm_bottom"])
+                row["center"] = sum(item["norm_y"] for item in row["items"]) / len(row["items"])
+                placed = True
+                break
+        if not placed:
+            rows.append(
+                {
+                    "top": desc["norm_top"],
+                    "bottom": desc["norm_bottom"],
+                    "center": desc["norm_y"],
+                    "items": [desc],
+                }
+            )
+
+    ordered: list[dict[str, Any]] = []
+    for row in sorted(rows, key=lambda item: (item["center"], item["top"])):
+        ordered.extend(sorted(row["items"], key=lambda item: (item["norm_x"], item["norm_y"], item["index"])))
+    return ordered
+
+
+def product_position_match_score(left: dict[str, Any], right: dict[str, Any]) -> float:
+    center_distance = math.hypot(left["norm_x"] - right["norm_x"], left["norm_y"] - right["norm_y"])
+    area_delta = abs(math.log(max(left["norm_area"], 1e-6) / max(right["norm_area"], 1e-6)))
+    aspect_delta = abs(math.log(max(left["aspect"], 1e-6) / max(right["aspect"], 1e-6)))
+    return center_distance * 10.0 + area_delta * 0.75 + aspect_delta * 0.25
+
+
+def greedy_product_position_assignment(
+    left: list[dict[str, Any]],
+    right: list[dict[str, Any]],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    candidates = [
+        (product_position_match_score(left_item, right_item), left_index, right_index)
+        for left_index, left_item in enumerate(left)
+        for right_index, right_item in enumerate(right)
+    ]
+    candidates.sort()
+    used_left: set[int] = set()
+    used_right: set[int] = set()
+    pairs: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    for _, left_index, right_index in candidates:
+        if left_index in used_left or right_index in used_right:
+            continue
+        used_left.add(left_index)
+        used_right.add(right_index)
+        pairs.append((left[left_index], right[right_index]))
+        if len(pairs) == min(len(left), len(right)):
+            break
+    left_order = {id(item): index for index, item in enumerate(left)}
+    pairs.sort(key=lambda pair: left_order[id(pair[0])])
+    return pairs
+
+
+def minimum_product_position_assignment(
+    left: list[dict[str, Any]],
+    right: list[dict[str, Any]],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    if len(left) != len(right):
+        return greedy_product_position_assignment(left, right)
+    count = len(left)
+    if count > 16:
+        return greedy_product_position_assignment(left, right)
+
+    memo: dict[tuple[int, int], tuple[float, tuple[int, ...]]] = {}
+
+    def solve(left_index: int, used_mask: int) -> tuple[float, tuple[int, ...]]:
+        key = (left_index, used_mask)
+        if key in memo:
+            return memo[key]
+        if left_index >= count:
+            return 0.0, ()
+
+        best_cost = float("inf")
+        best_order: tuple[int, ...] = ()
+        for right_index in range(count):
+            bit = 1 << right_index
+            if used_mask & bit:
+                continue
+            rest_cost, rest_order = solve(left_index + 1, used_mask | bit)
+            total_cost = product_position_match_score(left[left_index], right[right_index]) + rest_cost
+            order = (right_index,) + rest_order
+            if total_cost < best_cost - 1e-9 or (abs(total_cost - best_cost) <= 1e-9 and order < best_order):
+                best_cost = total_cost
+                best_order = order
+        memo[key] = best_cost, best_order
+        return memo[key]
+
+    _, right_order = solve(0, 0)
+    return [(left[index], right[right_index]) for index, right_index in enumerate(right_order)]
+
+
+def nearest_product_descriptor(
+    source: dict[str, Any],
+    candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return min(
+        candidates,
+        key=lambda item: (product_position_match_score(source, item), item["norm_y"], item["norm_x"], item["index"]),
+    )
+
+
+def position_matched_product_pairs(
+    mask1_descriptors: list[dict[str, Any]],
+    mask2_descriptors: list[dict[str, Any]],
+) -> list[tuple[dict[str, Any], dict[str, Any]]]:
+    ordered_mask1 = spatially_order_product_descriptors(mask1_descriptors)
+    ordered_mask2 = spatially_order_product_descriptors(mask2_descriptors)
+    if len(ordered_mask1) == len(ordered_mask2):
+        return minimum_product_position_assignment(ordered_mask1, ordered_mask2)
+    if len(ordered_mask1) > len(ordered_mask2):
+        return [(mask1_item, nearest_product_descriptor(mask1_item, ordered_mask2)) for mask1_item in ordered_mask1]
+
+    pairs = [
+        (nearest_product_descriptor(mask2_item, ordered_mask1), mask2_item)
+        for mask2_item in ordered_mask2
+    ]
+    mask1_order = {id(item): index for index, item in enumerate(ordered_mask1)}
+    pairs.sort(key=lambda pair: (mask1_order[id(pair[0])], pair[1]["norm_y"], pair[1]["norm_x"], pair[1]["index"]))
+    return pairs
+
+
 def slice_mask_pair_by_product_bbox(
     mask1_images: list[Image.Image],
     mask2_images: list[Image.Image] | None,
@@ -507,6 +685,62 @@ def slice_masks_by_product_bbox(
             pair_mask1, pair_mask2 = slice_mask_pair_by_product_bbox(
                 mask1_images,
                 [mask2_image],
+                min_area_ratio,
+                rows,
+                columns,
+                auto_match_orientation,
+                output_mode,
+            )
+            output_mask1.extend(pair_mask1)
+            output_mask2.extend(pair_mask2)
+        return output_mask1, output_mask2
+
+    if match_mode == "pair_by_position":
+        output_mask1: list[Image.Image] = []
+        output_mask2: list[Image.Image] = []
+        mask1_descriptors = product_mask_descriptors(mask1_images, min_area_ratio)
+        mask1_size = mask1_images[0].size if mask1_images else (1, 1)
+
+        if not mask1_descriptors:
+            mask2_size = mask2_images[0].size if mask2_images else mask1_size
+            return ([Image.new("L", mask1_size, 0)], [Image.new("L", mask2_size, 0)])
+
+        if not mask2_images:
+            for mask1_desc in spatially_order_product_descriptors(mask1_descriptors):
+                pair_mask1, pair_mask2 = slice_mask_pair_by_product_bbox(
+                    [mask1_desc["mask"]],
+                    None,
+                    min_area_ratio,
+                    rows,
+                    columns,
+                    auto_match_orientation,
+                    output_mode,
+                )
+                output_mask1.extend(pair_mask1)
+                output_mask2.extend(pair_mask2)
+            return output_mask1, output_mask2
+
+        mask2_descriptors = product_mask_descriptors(mask2_images, min_area_ratio)
+        if not mask2_descriptors:
+            mask2_size = mask2_images[0].size
+            for mask1_desc in spatially_order_product_descriptors(mask1_descriptors):
+                pair_mask1, pair_mask2 = slice_mask_pair_by_product_bbox(
+                    [mask1_desc["mask"]],
+                    [Image.new("L", mask2_size, 0)],
+                    min_area_ratio,
+                    rows,
+                    columns,
+                    auto_match_orientation,
+                    output_mode,
+                )
+                output_mask1.extend(pair_mask1)
+                output_mask2.extend(pair_mask2)
+            return output_mask1, output_mask2
+
+        for mask1_desc, mask2_desc in position_matched_product_pairs(mask1_descriptors, mask2_descriptors):
+            pair_mask1, pair_mask2 = slice_mask_pair_by_product_bbox(
+                [mask1_desc["mask"]],
+                [mask2_desc["mask"]],
                 min_area_ratio,
                 rows,
                 columns,
