@@ -13,11 +13,13 @@ from .mask_utils import (
     bbox_from_mask_or_none,
     bbox_mask,
     binary_mask,
+    clamp_int_value,
     combine_masks,
     focus_crop,
     make_spatial_mask,
     mask_batch_size,
     mask_indices_for_image,
+    normalize_choice,
     offset_bbox,
     prepare_paste_mask,
     refine_error,
@@ -33,6 +35,7 @@ from .transform_utils import (
     clamp_box,
     composite_masked,
     composite_masked_same_size,
+    flatten_refine_info_items,
     flux_kontext_target_size,
     image_batch_size,
     image_content_signature,
@@ -59,6 +62,107 @@ from .nodes_transform import RefineNodeMatchProductAngle, RefineNodeRotateImage
 from .mask_utils import _BILINEAR, _LANCZOS, _NEAREST
 
 
+def _first_input_value(value: Any, default: Any) -> Any:
+    if isinstance(value, list):
+        return value[0] if value else default
+    return default if value is None else value
+
+
+def _bool_input_value(value: Any, default: bool = False) -> bool:
+    return bool(_first_input_value(value, default))
+
+
+def _input_values(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else [value]
+
+
+def _image_input_count(images: torch.Tensor | list[torch.Tensor] | None) -> int:
+    if images is None:
+        return 0
+    count = 0
+    for value in _input_values(images):
+        if value is None:
+            continue
+        count += image_batch_size(value)
+    return count
+
+
+def _mask_input_count(masks: torch.Tensor | list[torch.Tensor] | None) -> int:
+    if masks is None:
+        return 0
+    count = 0
+    for value in _input_values(masks):
+        if value is None:
+            continue
+        count += mask_batch_size(value)
+    return count
+
+
+def _select_image_tensor(
+    images: torch.Tensor | list[torch.Tensor] | None,
+    index: int,
+    node_name: str,
+    slot_name: str,
+) -> torch.Tensor:
+    last_value = None
+    last_count = 0
+    remaining = int(index)
+    for value in _input_values(images):
+        if value is None:
+            continue
+        count = image_batch_size(value)
+        if count <= 0:
+            continue
+        if remaining < count:
+            return _single_image_tensor(value, remaining, node_name, slot_name)
+        remaining -= count
+        last_value = value
+        last_count = count
+    if last_value is not None and last_count > 0:
+        return _single_image_tensor(last_value, last_count - 1, node_name, slot_name)
+    refine_error(node_name, f"Missing {slot_name} image input.")
+
+
+def _single_image_tensor(
+    image: torch.Tensor,
+    index: int,
+    node_name: str,
+    slot_name: str,
+) -> torch.Tensor:
+    if image.ndim == 4:
+        sample = image[min(int(index), image.shape[0] - 1)].unsqueeze(0)
+    elif image.ndim == 3:
+        sample = image.unsqueeze(0)
+    else:
+        refine_error(node_name, f"Expected {slot_name} IMAGE tensor with 3 or 4 dims, got {tuple(image.shape)}.")
+    if sample.shape[-1] == 1:
+        sample = sample.repeat(1, 1, 1, 3)
+    elif sample.shape[-1] == 4:
+        sample = sample[..., :3]
+    if sample.shape[-1] != 3:
+        refine_error(node_name, f"Expected {slot_name} IMAGE channel count 1, 3, or 4, got {sample.shape[-1]}.")
+    return sample
+
+
+def _select_mask_pil(
+    masks: torch.Tensor | list[torch.Tensor] | None,
+    index: int,
+    size: tuple[int, int],
+    node_name: str,
+) -> Image.Image:
+    remaining = int(index)
+    for value in _input_values(masks):
+        if value is None:
+            continue
+        count = mask_batch_size(value)
+        if count <= 0:
+            continue
+        if remaining < count:
+            return tensor_mask_to_pil(value, remaining, size)
+        remaining -= count
+    refine_error(node_name, f"Missing mask index {index}.")
+
+
 class RefineNodePreprocessMask:
     @classmethod
     def INPUT_TYPES(cls):
@@ -76,20 +180,26 @@ class RefineNodePreprocessMask:
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "MASK", "REFINENODE_INFO")
     RETURN_NAMES = ("image", "spatial_mask_image", "mask", "info")
+    INPUT_IS_LIST = True
     OUTPUT_IS_LIST = (True, True, True, True)
     FUNCTION = "preprocess"
     CATEGORY = "RefineNode"
 
     def preprocess(
         self,
-        image: torch.Tensor,
-        focus_crop: bool,
-        focus_crop_margin: int,
-        spatial_prompt_source: str,
-        mask: torch.Tensor | None = None,
+        image: torch.Tensor | list[torch.Tensor],
+        focus_crop: bool | list[bool],
+        focus_crop_margin: int | list[int],
+        spatial_prompt_source: str | list[str],
+        mask: torch.Tensor | list[torch.Tensor] | None = None,
     ):
-        image_count = image_batch_size(image)
-        mask_count = mask_batch_size(mask)
+        focus_crop_value = _bool_input_value(focus_crop, True)
+        focus_crop_margin_value = clamp_int_value(focus_crop_margin, 64, 0, 2048)
+        spatial_prompt_source_value = normalize_choice(spatial_prompt_source, "mask", {"mask", "bbox"})
+        image_count = _image_input_count(image)
+        mask_count = _mask_input_count(mask)
+        if image_count <= 0:
+            refine_error("RefineNode Preprocess Mask", "Missing input images.")
         model_images = []
         spatial_images = []
         model_masks = []
@@ -109,16 +219,16 @@ class RefineNodePreprocessMask:
             crop_box = None
             bbox_model = bbox_raw
 
-            if focus_crop and bbox_raw is not None:
+            if focus_crop_value and bbox_raw is not None:
                 model_image, model_mask, crop_box = focus_crop_region(
                     original,
                     mask_l,
                     bbox_raw,
-                    int(focus_crop_margin),
+                    int(focus_crop_margin_value),
                 )
                 bbox_model = offset_bbox(bbox_raw, crop_box[0], crop_box[1])
 
-            spatial_mask = make_spatial_mask(model_mask, spatial_prompt_source, bbox_model)
+            spatial_mask = make_spatial_mask(model_mask, spatial_prompt_source_value, bbox_model)
             group_id = f"source_image_{source_image_index}"
 
             model_images.append(tensor_image_as_list_item(model_image))
@@ -137,7 +247,7 @@ class RefineNodePreprocessMask:
                     "bbox_model": bbox_model,
                     "crop_box": crop_box,
                     "has_region": has_region,
-                    "spatial_prompt_source": spatial_prompt_source,
+                    "spatial_prompt_source": spatial_prompt_source_value,
                     "source_image_index": int(source_image_index),
                     "mask_index": None if mask_index is None else int(mask_index),
                     "mask_indices": [int(value) for value in mask_indices],
@@ -150,7 +260,12 @@ class RefineNodePreprocessMask:
             )
 
         for image_index in range(image_count):
-            original = normalize_to_srgb(tensor_image_to_pil(image, image_index))
+            original = normalize_to_srgb(
+                tensor_image_to_pil(
+                    _select_image_tensor(image, image_index, "RefineNode Preprocess Mask", "image"),
+                    0,
+                )
+            )
             if mask is None:
                 append_job(
                     original,
@@ -173,7 +288,7 @@ class RefineNodePreprocessMask:
                 continue
 
             for mask_index in indices:
-                mask_l = tensor_mask_to_pil(mask, mask_index, original.size)
+                mask_l = _select_mask_pil(mask, mask_index, original.size, "RefineNode Preprocess Mask")
                 append_job(
                     original,
                     mask_l,
@@ -214,95 +329,99 @@ class RefineNodeReferenceImageProcess:
         "image3",
         "info",
     )
+    INPUT_IS_LIST = True
+    OUTPUT_IS_LIST = (True, True, True, True)
     FUNCTION = "process"
     CATEGORY = "RefineNode"
 
     def process(
         self,
-        image1: torch.Tensor,
-        fit_kontext_size: bool,
-        resize_method: str,
-        crop_mode: str,
-        image2: torch.Tensor | None = None,
-        image3: torch.Tensor | None = None,
-        info: dict[str, Any] | None = None,
+        image1: torch.Tensor | list[torch.Tensor],
+        fit_kontext_size: bool | list[bool],
+        resize_method: str | list[str],
+        crop_mode: str | list[str],
+        image2: torch.Tensor | list[torch.Tensor] | None = None,
+        image3: torch.Tensor | list[torch.Tensor] | None = None,
+        info: dict[str, Any] | list[Any] | None = None,
     ):
-        batch = max(image_batch_size(image1), image_batch_size(image2), image_batch_size(image3))
+        fit_kontext_size_value = _bool_input_value(fit_kontext_size, True)
+        resize_method_value = normalize_choice(resize_method, DEFAULT_RESIZE_METHOD, set(IMAGE_RESIZE_METHODS))
+        crop_mode_value = normalize_choice(crop_mode, "crop", {"crop", "disable", "fill"})
+        batch = _image_input_count(image1)
+        if batch <= 0:
+            refine_error("RefineNode Reference Image Process", "Missing image1 input.")
+
+        info_items = flatten_refine_info_items(info)
+        if info_items and len(info_items) != batch:
+            refine_error(
+                "RefineNode Reference Image Process",
+                "REFINENODE_INFO item count must match image1 list count; "
+                f"got {len(info_items)} info items for {batch} image1 items.",
+            )
+
         image1_outputs = []
         image2_outputs = []
         image3_outputs = []
-        slot_transforms: dict[str, list[dict[str, Any] | None]] = {
-            "image1": [],
-            "image2": [],
-            "image3": [],
-        }
-        target_size = None
+        info_outputs = []
 
         for index in range(batch):
-            samples1 = tensor_image_to_pil(image1, index)
+            sample1 = _select_image_tensor(image1, index, "RefineNode Reference Image Process", "image1")
+            samples1 = tensor_image_to_pil(sample1, 0)
             first = normalize_to_srgb(samples1)
-            if fit_kontext_size:
+            if fit_kontext_size_value:
                 width, height = flux_kontext_target_size(*first.size)
                 sizing_mode = "flux_kontext"
             else:
                 width, height = calculate_dimensions_area(VAE_IMAGE_SIZE, first.size[0], first.size[1], 8)
                 sizing_mode = "area_1024"
 
-            if target_size is None:
-                target_size = (width, height)
-            elif (width, height) != target_size:
-                refine_error(
-                    "RefineNode Reference Image Process",
-                    "Batch items resolve to different Flux Kontext sizes. "
-                    "Split the batch or use images with the same aspect ratio.",
-                )
-
             processed = []
+            current_transforms: dict[str, list[dict[str, Any] | None]] = {}
             for slot, image in (("image1", image1), ("image2", image2), ("image3", image3)):
                 if image is None:
-                    slot_transforms[slot].append(None)
-                    processed.append(image1.detach().new_zeros((height, width, 3)))
+                    current_transforms[slot] = [None]
+                    processed.append(sample1.detach().new_zeros((1, height, width, 3)))
                     continue
-                source_pil = normalize_to_srgb(tensor_image_to_pil(image, index))
-                slot_transforms[slot].append(
+                sample = _select_image_tensor(image, index, "RefineNode Reference Image Process", slot)
+                source_pil = normalize_to_srgb(tensor_image_to_pil(sample, 0))
+                current_transforms[slot] = [
                     reference_image_transform_metadata(
                         source_pil.size,
                         (width, height),
-                        resize_method,
-                        crop_mode,
+                        resize_method_value,
+                        crop_mode_value,
                         sizing_mode,
                         image_content_signature(source_pil),
                     )
-                )
-                sample = image.detach()
-                if sample.ndim == 4:
-                    sample = sample[min(index, sample.shape[0] - 1)].unsqueeze(0)
-                elif sample.ndim == 3:
-                    sample = sample.unsqueeze(0)
-                else:
-                    refine_error("RefineNode Reference Image Process", f"Expected IMAGE tensor with 3 or 4 dims, got {tuple(image.shape)}")
-                if sample.shape[-1] == 1:
-                    sample = sample.repeat(1, 1, 1, 3)
-                elif sample.shape[-1] == 4:
-                    sample = sample[..., :3]
-                if sample.shape[-1] != 3:
-                    refine_error("RefineNode Reference Image Process", f"Expected IMAGE tensor channel count 1, 3, or 4, got {sample.shape[-1]}")
+                ]
                 sample = sample.movedim(-1, 1)
-                out = upscale_to_kontext_size(sample, width, height, resize_method, crop_mode).movedim(1, -1)
-                processed.append(out[0])
+                out = upscale_to_kontext_size(
+                    sample,
+                    width,
+                    height,
+                    resize_method_value,
+                    crop_mode_value,
+                ).movedim(1, -1)
+                processed.append(out)
 
             image1_outputs.append(processed[0])
             image2_outputs.append(processed[1])
             image3_outputs.append(processed[2])
-
-        if target_size is None:
-            refine_error("RefineNode Reference Image Process", "Missing input images.")
+            if info_items:
+                info_outputs.append(
+                    update_info_with_kontext_transforms(
+                        {"items": [info_items[index]]},
+                        current_transforms,
+                    )
+                )
+            else:
+                info_outputs.append({"items": []})
 
         return (
-            torch.stack(image1_outputs, dim=0),
-            torch.stack(image2_outputs, dim=0),
-            torch.stack(image3_outputs, dim=0),
-            update_info_with_kontext_transforms(info, slot_transforms),
+            image1_outputs,
+            image2_outputs,
+            image3_outputs,
+            info_outputs,
         )
 
 

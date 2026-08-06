@@ -387,15 +387,39 @@ def pil_resize_filter(method: str | None) -> int:
     return _BICUBIC
 
 
+def flatten_refine_info_items(info: dict[str, Any] | list[Any] | None) -> list[Any]:
+    if info is None:
+        return []
+    values = info if isinstance(info, list) else [info]
+    items = []
+    for value in values:
+        if isinstance(value, list):
+            items.extend(flatten_refine_info_items(value))
+            continue
+        if not isinstance(value, dict):
+            continue
+        value_items = value.get("items")
+        if isinstance(value_items, list):
+            items.extend(value_items)
+        elif value_items is not None:
+            items.append(value_items)
+    return items
+
+
 def update_info_with_kontext_transforms(
-    info: dict[str, Any] | None,
+    info: dict[str, Any] | list[Any] | None,
     slot_transforms: dict[str, list[dict[str, Any] | None]],
 ) -> dict[str, Any]:
-    if not isinstance(info, dict):
-        return {"items": []}
-    items = info.get("items")
+    base_info = {}
+    values = info if isinstance(info, list) else [info]
+    for value in values:
+        if isinstance(value, dict):
+            base_info = value.copy()
+            break
+    items = flatten_refine_info_items(info)
     if not items or not slot_transforms:
-        return info
+        base_info["items"] = items
+        return base_info
 
     def transform_at(slot: str, index: int) -> dict[str, Any] | None:
         transforms = slot_transforms.get(slot) or []
@@ -454,7 +478,7 @@ def update_info_with_kontext_transforms(
             updated["reference_image_transform_source"] = selected_source
         updated_items.append(updated)
 
-    updated_info = info.copy()
+    updated_info = base_info.copy()
     updated_info["items"] = updated_items
     return updated_info
 
